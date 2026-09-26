@@ -500,18 +500,38 @@ print(re.search(r"(a)\1", "aa"))
 }
 
 #[test]
-fn hyperbolic_math_functions_match_cpython() {
+fn hyperbolic_math_functions_match_cpython_within_one_ulp() {
     let source = r#"import math
 print(math.sinh(1), math.cosh(1), math.tanh(1))
 print(math.asinh(1), math.acosh(2), math.atanh(0.5))"#;
-    assert_eq!(
-        run(source),
-        (
-            0,
-            b"1.1752011936438014 1.5430806348152437 0.7615941559557649\n0.881373587019543 1.3169578969248166 0.5493061443340549\n".to_vec(),
-            Vec::new()
-        )
-    );
+    let (status, stdout, stderr) = run(source);
+    assert_eq!(status, 0);
+    assert!(stderr.is_empty());
+    let values = String::from_utf8(stdout)
+        .unwrap()
+        .split_whitespace()
+        .map(|value| value.parse::<f64>().unwrap())
+        .collect::<Vec<_>>();
+    // References recorded from CPython 3.14 on macOS. Both runtimes use platform libm;
+    // Linux atanh(0.5) returns the adjacent float ending in 0548 rather than 0549.
+    // Check numeric accuracy, not platform-dependent last digits in float repr.
+    let expected: [f64; 6] = [
+        1.1752011936438014,
+        1.5430806348152437,
+        0.7615941559557649,
+        0.881373587019543,
+        1.3169578969248166,
+        0.5493061443340549,
+    ];
+    assert_eq!(values.len(), expected.len());
+    for (value, expected) in values.into_iter().zip(expected) {
+        assert!(value.is_finite());
+        // All reference values are positive, so bit distance is the ULP distance.
+        assert!(
+            value.to_bits().abs_diff(expected.to_bits()) <= 1,
+            "{value} differs from {expected} by more than one ULP"
+        );
+    }
 }
 
 #[test]
