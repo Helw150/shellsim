@@ -650,6 +650,9 @@ assert F(5e-324).denominator == 2**1074
 assert F(0.1) != F(1, 10)
 assert F(1, 3) < 0.5 and 0.5 > F(1, 3)
 assert F(1, 2) == 0.5
+assert F(10**1000) < float('inf')
+assert F(-10**1000) > -float('inf')
+assert not F(1, 2) <= float('nan')
 assert not F(0) and bool(F(1, 3))
 assert F(2, 3) - F(1, 6) == F(1, 2)
 assert 1 - F(1, 3) == F(2, 3)

@@ -215,7 +215,7 @@ class Fraction:
 
     def __lt__(self, other):
         if isinstance(other, float) and not _math.isfinite(other):
-            return float(self) < other
+            return other == _math.inf
         n, d = _ratio(other)
         return self.numerator * d < n * self.denominator
 
@@ -224,7 +224,7 @@ class Fraction:
 
     def __gt__(self, other):
         if isinstance(other, float) and not _math.isfinite(other):
-            return float(self) > other
+            return other == -_math.inf
         n, d = _ratio(other)
         return self.numerator * d > n * self.denominator
 
