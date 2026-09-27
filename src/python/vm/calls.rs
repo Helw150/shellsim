@@ -20,7 +20,7 @@ impl Vm<'_> {
         Ok((integer, decimal.len()))
     }
 
-    fn dir_names(&self, value: &Value) -> Result<Vec<String>, String> {
+    pub(super) fn dir_names(&self, value: &Value) -> Result<Vec<String>, String> {
         if let Some(NativeValue::Module(module)) = value.native_value() {
             return Ok(module
                 .functions

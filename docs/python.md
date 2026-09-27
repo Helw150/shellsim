@@ -52,7 +52,7 @@ Function calls support positional, variadic, keyword-only, and keyword-variadic 
 including bounded `*iterable` and `**mapping` expansion. Duplicate keywords, non-string mapping
 keys, and non-mapping `**` operands are rejected explicitly.
 
-Text formatting uses one protocol for f-strings and `str.format`, including conversions,
+Text formatting uses one protocol for f-strings, `format()`, and `str.format`, including conversions,
 alignment, width and precision, and decimal, binary, octal, and hexadecimal integer formats.
 It also handles signed fixed-point output, general floating-point precision, and decimal comma
 grouping. The `__import__` builtin uses the simulated loader for absolute imports; relative
@@ -61,6 +61,15 @@ builtin accepts one source string and executes it in the simulated namespace. Co
 explicit globals or locals mappings are not supported.
 The frozen `functools` module provides `reduce` and positional and keyword argument binding with
 `partial`.
+
+Wildcard imports bind `__all__` when present, otherwise names without a leading underscore.
+They work with native, frozen, and VFS modules and are restricted to module scope.
+
+`math.gamma` and `math.lgamma` use pure Rust libm kernels with Python domain and overflow errors.
+The frozen `fractions` module provides normalized exact rational arithmetic, integer-pair,
+fraction, finite-float and rational/decimal-string construction, comparisons, numeric conversions,
+and `limit_denominator`. Decimal objects, the `numbers` ABC hierarchy, Fraction formatting,
+hashing, and rounding helpers are not supported.
 
 User-defined exception subclasses preserve inherited constructor arguments, including compatible
 `args`, `str`, and `repr` behavior.

@@ -530,3 +530,73 @@ fn import_builtin_rejects_relative_and_unavailable_imports() {
         assert!(error.contains(expected), "{error}");
     }
 }
+
+#[test]
+fn builtin_format_function_matches_python() {
+    let source = r#"print(format(3.14159, ".2f"))
+print(format(42, "x"))
+"#;
+    assert_eq!(run(source), (0, "3.14\n2a\n".into(), String::new()));
+}
+
+#[test]
+fn builtin_format_uses_shared_grammar_and_rejects_invalid_arguments() {
+    let source = r#"assert format(3.5) == '3.5'
+assert format(42, '#06x') == '0x002a'
+assert format('x', '>5s') == '    x'
+assert format(1+2j, '+.1f') == '+1.0+2.0j'
+for args in [(), (1, '', ''), (1, 2)]:
+    try:
+        format(*args)
+        assert False
+    except TypeError:
+        pass
+try:
+    format(1, spec='d')
+    assert False
+except TypeError:
+    pass
+try:
+    format(1, 'bad')
+    assert False
+except ValueError:
+    pass
+print('ok')
+"#;
+    assert_eq!(run(source), (0, "ok\n".into(), String::new()));
+}
+
+#[test]
+fn numeric_conversions_use_class_methods_and_preserve_large_integers() {
+    let source = r#"class Number:
+    def __int__(self):
+        return 10**100
+    def __float__(self):
+        return 0.5
+n = Number()
+n.__int__ = lambda: 7
+n.__float__ = lambda: 7.0
+assert int(n) == 10**100 and float(n) == 0.5
+assert int(1e100) == 10000000000000000159028911097599180468360808563945281389781327557747838772170381060813469985856815104
+assert int(-1.75) == -1
+class Bad:
+    def __int__(self):
+        return '1'
+    def __float__(self):
+        return 1
+for conversion in [int, float]:
+    try:
+        conversion(Bad())
+        assert False
+    except TypeError:
+        pass
+for value, error in [(float('nan'), ValueError), (float('inf'), OverflowError)]:
+    try:
+        int(value)
+        assert False
+    except error:
+        pass
+print('ok')
+"#;
+    assert_eq!(run(source), (0, "ok\n".into(), String::new()));
+}

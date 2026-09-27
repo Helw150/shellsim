@@ -160,6 +160,7 @@ impl Vm<'_> {
                 Opcode::Import { name, bind_root } => {
                     dispatch_next(self.import(code.name(name), bind_root))
                 }
+                Opcode::ImportStar => dispatch_next(self.import_star()),
                 Opcode::LoadAttribute(name) => {
                     let symbol = self
                         .symbol_for(code, code_cache, name)

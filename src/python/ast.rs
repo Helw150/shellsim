@@ -19,6 +19,10 @@ pub enum StatementKind {
     Import {
         modules: Vec<(String, String)>,
     },
+    /// Bind public module names, or the explicit names in `__all__`.
+    ImportStar {
+        module: String,
+    },
     ImportFrom {
         module: String,
         names: Vec<(String, String)>,

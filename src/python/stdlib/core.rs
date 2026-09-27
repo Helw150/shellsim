@@ -26,6 +26,7 @@ static BUILTINS: &[FunctionDef] = &[
     builtin("getattr", builtin_getattr),
     builtin("hasattr", builtin_hasattr),
     builtin("round", builtin_round),
+    builtin("format", builtin_format),
 ];
 
 /// Resolve capability-free builtins implemented through the erased runtime API.
@@ -2300,6 +2301,21 @@ fn builtin_hasattr(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
             .get_attribute(args.positional()[0], &name)?
             .is_some(),
     ))
+}
+
+/// Use the same bounded rendering path as f-strings and `str.format`.
+fn builtin_format(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("format", 1, 2)?;
+    args.reject_keywords("format")?;
+    let specification = args
+        .positional()
+        .get(1)
+        .map(|value| value.cast::<OwnedPyString>(runtime))
+        .transpose()?
+        .map(|value| value.0)
+        .unwrap_or_default();
+    let rendered = runtime.format_value(&args.positional()[0], None, &specification)?;
+    runtime.new_string(rendered)
 }
 
 fn builtin_round(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {

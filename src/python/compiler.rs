@@ -209,6 +209,23 @@ impl Compiler {
                     self.emit(Operation::StoreName(binding), span);
                 }
             }
+            StatementKind::ImportStar { module } => {
+                if self.in_function || self.is_class_scope {
+                    self.emit(
+                        Operation::RuntimeError("import * only allowed at module level".into()),
+                        span,
+                    );
+                } else {
+                    self.emit(
+                        Operation::Import {
+                            name: module,
+                            bind_root: false,
+                        },
+                        span,
+                    );
+                    self.emit(Operation::ImportStar, span);
+                }
+            }
             StatementKind::ImportFrom { module, names: _ } if module == "__future__" => {}
             StatementKind::ImportFrom { module, names } => {
                 self.emit(

@@ -929,6 +929,26 @@ impl Heap {
             .parent)
     }
 
+    /// Size a module-name snapshot before allocating it during wildcard import.
+    pub fn scope_name_storage(&self, scope: ScopeId) -> Result<(usize, usize), String> {
+        let scope = self
+            .scopes
+            .get(scope.0)
+            .and_then(Option::as_ref)
+            .ok_or("invalid scope reference")?;
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        for name in scope.values.keys().chain(scope.local_names.iter()) {
+            count = count
+                .checked_add(1)
+                .ok_or("module namespace is too large")?;
+            bytes = bytes
+                .checked_add(name.len().saturating_add(64))
+                .ok_or("module namespace is too large")?;
+        }
+        Ok((count, bytes))
+    }
+
     pub fn scope_values(&self, scope: ScopeId) -> Result<HashMap<String, Value>, String> {
         let scope = self
             .scopes

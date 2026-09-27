@@ -755,3 +755,50 @@ fn array_composition_and_rounding_reject_invalid_inputs() {
         assert_fails_with(&format!("import numpy as np\n{source}"), expected);
     }
 }
+
+#[test]
+fn trace_sums_the_main_diagonal() {
+    let source = r#"import numpy as np
+a = np.array([[1, 2], [3, 4]])
+print(a.trace())
+print(np.trace(a))
+"#;
+    assert_eq!(run(source), (0, b"5\n5\n".to_vec(), Vec::new()));
+}
+
+#[test]
+fn trace_handles_axes_offsets_views_and_accumulator_dtypes() {
+    let source = r#"import numpy as np
+a = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int8)
+assert a.trace() == 6 and type(a.trace()) is np.int64
+assert a.trace(1) == 8 and a.trace(-1) == 4
+assert a.trace(100) == 0 and a.trace(-100) == 0
+assert a.T.trace(-1) == 8
+assert a[::-1].trace() == 6
+b = np.arange(24).reshape(2, 3, 4)
+assert np.trace(b).tolist() == [16, 18, 20, 22]
+assert b.trace(axis1=-2, axis2=-1).tolist() == [15, 51]
+assert b.trace(axis1=2, axis2=0).tolist() == [13, 21, 29]
+assert np.trace([[1, 2], [3, 4]]) == 5
+assert np.zeros((0, 3)).trace() == 0.0
+assert np.zeros((0, 2, 2)).trace(axis1=1, axis2=2).shape == (0,)
+assert type(np.ones((2, 2), dtype=np.float32).trace()) is np.float32
+assert type(np.ones((2, 2), dtype=np.uint8).trace()) is np.uint64
+assert np.ones((2, 2), dtype=bool).trace() == 2
+assert a.trace(dtype=np.float64) == 6.0
+assert np.array([[1+2j, 0], [0, 3-4j]]).trace() == 4-2j
+print('ok')
+"#;
+    assert_eq!(run(source), (0, b"ok\n".to_vec(), Vec::new()));
+    for source in [
+        "np.trace([1, 2])",
+        "np.eye(2).trace(axis1=0, axis2=0)",
+        "np.eye(2).trace(axis2=2)",
+        "np.eye(2).trace(offset=0.5)",
+        "np.eye(2).trace(0, offset=1)",
+        "np.eye(2).trace(out=np.zeros(1))",
+    ] {
+        let (status, _, _) = run(&format!("import numpy as np\n{source}"));
+        assert_ne!(status, 0, "unexpected success: {source}");
+    }
+}

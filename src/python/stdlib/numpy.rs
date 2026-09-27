@@ -424,6 +424,7 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
         function("outer", outer),
         function("matmul", matmul),
         function("diag", diag),
+        function("trace", module_trace),
         function("allclose", allclose),
         function("array_equal", array_equal),
         function("argsort", argsort),
@@ -927,6 +928,7 @@ pub(crate) static ARRAY_TYPE: NativeTypeDef = NativeTypeDef {
         method("squeeze", method_squeeze),
         method("swapaxes", method_swapaxes),
         method("sum", method_sum),
+        method("trace", method_trace),
         method("prod", method_prod),
         method("mean", method_mean),
         method("min", method_min),
@@ -4737,6 +4739,111 @@ fn matmul_arrays(runtime: &mut dyn PyRuntime, left: PyArray, right: PyArray) -> 
         }
     }
     runtime.new_array(values, shape, dtype)
+}
+
+fn module_trace(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("numpy.trace", 1, 5)?;
+    args.reject_unknown_keywords("numpy.trace", &["offset", "axis1", "axis2", "dtype"])?;
+    let array = coerce_array(runtime, args.positional()[0])?;
+    trace(
+        runtime,
+        array,
+        CallArgs::new(args.positional()[1..].to_vec(), args.keywords().to_vec()),
+    )
+}
+
+fn method_trace(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let array = receiver.cast(runtime)?;
+    trace(runtime, array, args)
+}
+
+/// Sum diagonal elements on any two distinct axes using checked logical array access.
+/// Unselected axes retain their order; integer accumulation widens like `sum`, unless `dtype`
+/// is explicit. Empty diagonals have the additive identity, including in scalar results.
+fn trace(runtime: &mut dyn PyRuntime, array: PyArray, args: CallArgs) -> PyResult {
+    args.expect_positional("ndarray.trace", 0, 4)?;
+    args.reject_unknown_keywords("ndarray.trace", &["offset", "axis1", "axis2", "dtype"])?;
+    let mut parameters = [Value::Int(0), Value::Int(0), Value::Int(1), Value::None];
+    for (index, name) in ["offset", "axis1", "axis2", "dtype"].iter().enumerate() {
+        let keyword = args.keyword("trace", name)?;
+        if args.positional().get(index).is_some() && keyword.is_some() {
+            return Err(PyError::type_error(format!(
+                "trace() got multiple values for argument {name:?}"
+            )));
+        }
+        if let Some(value) = args.positional().get(index).or(keyword) {
+            parameters[index] = *value;
+        }
+    }
+    let (layout, input_dtype) = runtime.array_layout(array)?;
+    let shape = layout.shape;
+    if shape.len() < 2 {
+        return Err(PyError::value_error(
+            "diag requires an array of at least two dimensions",
+        ));
+    }
+    let PyIndex(offset) = parameters[0].cast(runtime)?;
+    let PyIndex(axis1) = parameters[1].cast(runtime)?;
+    let PyIndex(axis2) = parameters[2].cast(runtime)?;
+    let axis1 = normalize_axis(axis1, shape.len())?;
+    let axis2 = normalize_axis(axis2, shape.len())?;
+    if axis1 == axis2 {
+        return Err(PyError::value_error("axis1 and axis2 cannot be the same"));
+    }
+    let dtype = if parameters[3].is_none() {
+        reduction_dtype(input_dtype, Reduction::Sum)
+    } else {
+        parse_dtype(runtime, parameters[3])?
+    };
+    // Coercion follows the same explicit complex-to-real boundary as astype.
+    if input_dtype == PyArrayDtype::Complex128 && dtype != PyArrayDtype::Complex128 {
+        return Err(PyError::type_error(
+            "cannot cast complex values to a real dtype",
+        ));
+    }
+    let padding = usize::try_from(offset.unsigned_abs()).unwrap_or(usize::MAX);
+    let (row, column) = if offset >= 0 {
+        (0, padding)
+    } else {
+        (padding, 0)
+    };
+    let length = shape[axis1]
+        .saturating_sub(row)
+        .min(shape[axis2].saturating_sub(column));
+    let output_shape = shape
+        .iter()
+        .enumerate()
+        .filter_map(|(axis, size)| (axis != axis1 && axis != axis2).then_some(*size))
+        .collect::<Vec<_>>();
+    let count = element_count(&output_shape)?;
+    reserve_values(runtime, count)?;
+    let mut values = Vec::with_capacity(count);
+    for_each_index(&output_shape, |output_index| {
+        runtime.charge_cpu(1)?;
+        let mut index = vec![0; shape.len()];
+        let mut source = output_index.iter();
+        for (axis, coordinate) in index.iter_mut().enumerate() {
+            if axis != axis1 && axis != axis2 {
+                *coordinate = *source.next().expect("matching rank");
+            }
+        }
+        let mut total = numeric_identity(runtime, dtype, false)?;
+        for selected in 0..length {
+            runtime.charge_cpu(1)?;
+            index[axis1] = row + selected;
+            index[axis2] = column + selected;
+            let value = runtime.array_get(array, &index)?;
+            let value = convert(runtime, value, dtype)?;
+            total = runtime.binary_op(PyBinaryOp::Add, total, value)?;
+        }
+        values.push(total);
+        Ok(())
+    })?;
+    if output_shape.is_empty() {
+        Ok(values[0])
+    } else {
+        runtime.new_array(values, output_shape, dtype)
+    }
 }
 
 fn diag(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {

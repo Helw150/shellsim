@@ -2,8 +2,8 @@
 
 use super::{
     is_os_error, protocol, Arc, Builtin, BuiltinType, CodeRef, ExceptionType, Execution, HashMap,
-    NameId, NativeValue, Object, PyModuleLoader, PyRuntime, RaisedException, ScopeId, SymbolId,
-    Value, Vm,
+    NameId, NativeValue, Object, PyError, PyModuleLoader, PyRuntime, RaisedException, ScopeId,
+    SymbolId, Value, Vm,
 };
 
 impl Vm<'_> {
@@ -303,6 +303,88 @@ impl Vm<'_> {
             .copied()
             .ok_or("local bytecode requires a lexical scope")?;
         self.state.heap.scope_remove_local(scope, slot).map(|_| ())
+    }
+
+    /// Bind a module's declared exports, or its public namespace, in deterministic order.
+    /// Snapshots and explicit export iteration are metered before growing host storage.
+    pub(super) fn import_star(&mut self) -> Result<(), String> {
+        let module = self.pop()?;
+        let all = self.resolve_attribute(module, "__all__")?;
+        let mut names = Vec::new();
+        if let Some(all) = all {
+            let iterator = self.iterator(all).map_err(|error| error.to_string())?;
+            while let Some(value) = self
+                .iterator_next(iterator)
+                .map_err(|error| error.to_string())?
+            {
+                self.charge_cpu(1)?;
+                let Some(name) = super::super::string::string_ref(&self.state.heap, &value)? else {
+                    return Err(self
+                        .record_native_error(PyError::type_error("Item in __all__ must be str")));
+                };
+                self.reserve_result(name.as_str().len().saturating_add(64))?;
+                names.push(
+                    super::super::string::string_ref(&self.state.heap, &value)?
+                        .expect("checked string")
+                        .as_str()
+                        .to_string(),
+                );
+            }
+        } else {
+            let (count, bytes) =
+                if let Some(NativeValue::Module(definition)) = module.native_value() {
+                    let count = definition
+                        .functions
+                        .len()
+                        .saturating_add(definition.values.len());
+                    let bytes = definition
+                        .functions
+                        .iter()
+                        .map(|function| function.name.len().saturating_add(64))
+                        .chain(
+                            definition
+                                .values
+                                .iter()
+                                .map(|value| value.name().len().saturating_add(64)),
+                        )
+                        .fold(0usize, usize::saturating_add);
+                    (count, bytes)
+                } else {
+                    let id = module
+                        .object_id()
+                        .ok_or("wildcard import requires a module")?;
+                    let Object::Module { scope, .. } = self.state.heap.get(id)? else {
+                        return Err("wildcard import requires a module".into());
+                    };
+                    self.state.heap.scope_name_storage(*scope)?
+                };
+            self.charge_cpu(u64::try_from(count).unwrap_or(u64::MAX))?;
+            self.reserve_result(bytes)?;
+            names = self.dir_names(&module)?;
+            names.retain(|name| !name.starts_with('_'));
+            self.charge_cpu(
+                (names.len() as u64)
+                    .saturating_mul(u64::from(usize::BITS - names.len().leading_zeros())),
+            )?;
+            names.sort();
+            names.dedup();
+        }
+        for name in names {
+            self.charge_cpu(1)?;
+            let Some(value) = self.resolve_attribute(module, &name)? else {
+                return Err(self.record_native_error(PyError::exception(
+                    "AttributeError",
+                    format!("module has no attribute {name:?}"),
+                )));
+            };
+            let symbol = self
+                .state
+                .heap
+                .intern_symbol(&name, &mut self.interp.resources)?;
+            self.stack.push(value);
+            self.store_name(symbol, &name)?;
+        }
+        Ok(())
     }
 
     pub(super) fn store_name(&mut self, symbol: SymbolId, name: &str) -> Result<(), String> {

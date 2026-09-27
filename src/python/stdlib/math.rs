@@ -22,6 +22,16 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     functions: &[
         FunctionDef {
             module: "math",
+            name: "gamma",
+            call: native_gamma,
+        },
+        FunctionDef {
+            module: "math",
+            name: "lgamma",
+            call: native_lgamma,
+        },
+        FunctionDef {
+            module: "math",
             name: "atanh",
             call: native_atanh,
         },
@@ -209,6 +219,14 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
         },
     ],
 };
+
+fn native_gamma(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "gamma")
+}
+
+fn native_lgamma(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    native_call(runtime, args, "lgamma")
+}
 
 fn native_sinh(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "sinh")
@@ -572,6 +590,8 @@ pub fn constant(name: &str) -> Option<MathValue> {
 /// Dispatch one of the observed/reviewer-requested `math` functions.
 pub fn call(name: &str, args: &[f64]) -> MathResult {
     match name {
+        "gamma" => unary("gamma", args, |value| gamma(value, false)),
+        "lgamma" => unary("lgamma", args, |value| gamma(value, true)),
         "sinh" => unary("sinh", args, sinh),
         "cosh" => unary("cosh", args, cosh),
         "tanh" => unary("tanh", args, tanh),
@@ -617,6 +637,25 @@ pub fn call(name: &str, args: &[f64]) -> MathResult {
         "tan" => unary("tan", args, tan),
         _ => Err(MathError::UnknownFunction(name.to_string())),
     }
+}
+
+/// Pure Rust libm kernels avoid host FFI and global sign state. Python treats poles as domain
+/// errors, finite overflow as a range error, and propagates NaNs and allowed infinities.
+fn gamma(value: f64, logarithmic: bool) -> MathResult {
+    if (value.is_finite() && value <= 0.0 && value == value.trunc())
+        || (!logarithmic && value == f64::NEG_INFINITY)
+    {
+        return Err(MathError::ValueError("math domain error"));
+    }
+    let result = if logarithmic {
+        libm::lgamma(value)
+    } else {
+        libm::tgamma(value)
+    };
+    if value.is_finite() && result.is_infinite() {
+        return Err(MathError::OverflowError("math range error"));
+    }
+    Ok(MathValue::Float(result))
 }
 
 /// Hyperbolic functions preserve IEEE infinities and NaNs; finite overflow is a Python error.
@@ -832,6 +871,32 @@ mod tests {
             MathValue::Float(value) => value,
             other => panic!("expected float, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn gamma_poles_and_nonfinite_values_have_python_error_classes() {
+        for name in ["gamma", "lgamma"] {
+            for value in [0.0, -0.0, -3.0] {
+                assert_eq!(
+                    call(name, &[value]),
+                    Err(MathError::ValueError("math domain error"))
+                );
+            }
+            assert!(float(call(name, &[f64::NAN]).unwrap()).is_nan());
+        }
+        assert_eq!(call("gamma", &[5.0]), Ok(MathValue::Float(24.0)));
+        assert_eq!(
+            call("gamma", &[f64::NEG_INFINITY]),
+            Err(MathError::ValueError("math domain error"))
+        );
+        assert_eq!(
+            call("lgamma", &[f64::NEG_INFINITY]),
+            Ok(MathValue::Float(f64::INFINITY))
+        );
+        assert_eq!(
+            call("gamma", &[172.0]),
+            Err(MathError::OverflowError("math range error"))
+        );
     }
 
     #[test]

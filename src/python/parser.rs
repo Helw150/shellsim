@@ -369,32 +369,36 @@ impl Parser {
                 |kind| matches!(kind, TokenKind::Import),
                 "expected 'import' after module name",
             )?;
-            let mut names = Vec::new();
-            let parenthesized = self
-                .take(|kind| matches!(kind, TokenKind::LeftParen))
-                .is_some();
-            loop {
-                let imported = self.name("expected a name to import")?;
-                let binding = if self.take(|kind| matches!(kind, TokenKind::As)).is_some() {
-                    self.name("expected a binding after 'as'")?
-                } else {
-                    imported.clone()
-                };
-                names.push((imported, binding));
-                if self.take(|kind| matches!(kind, TokenKind::Comma)).is_none() {
-                    break;
+            if self.take(|kind| matches!(kind, TokenKind::Star)).is_some() {
+                StatementKind::ImportStar { module }
+            } else {
+                let mut names = Vec::new();
+                let parenthesized = self
+                    .take(|kind| matches!(kind, TokenKind::LeftParen))
+                    .is_some();
+                loop {
+                    let imported = self.name("expected a name to import")?;
+                    let binding = if self.take(|kind| matches!(kind, TokenKind::As)).is_some() {
+                        self.name("expected a binding after 'as'")?
+                    } else {
+                        imported.clone()
+                    };
+                    names.push((imported, binding));
+                    if self.take(|kind| matches!(kind, TokenKind::Comma)).is_none() {
+                        break;
+                    }
+                    if parenthesized && self.at(|kind| matches!(kind, TokenKind::RightParen)) {
+                        break;
+                    }
                 }
-                if parenthesized && self.at(|kind| matches!(kind, TokenKind::RightParen)) {
-                    break;
+                if parenthesized {
+                    self.expect(
+                        |kind| matches!(kind, TokenKind::RightParen),
+                        "expected ')' after imported names",
+                    )?;
                 }
+                StatementKind::ImportFrom { module, names }
             }
-            if parenthesized {
-                self.expect(
-                    |kind| matches!(kind, TokenKind::RightParen),
-                    "expected ')' after imported names",
-                )?;
-            }
-            StatementKind::ImportFrom { module, names }
         } else if self
             .take(|kind| matches!(kind, TokenKind::Import))
             .is_some()
@@ -2099,6 +2103,21 @@ mod tests {
     #[test]
     fn parses_chained_postfix_operations() {
         parse(lex("sys.stdout.write(sys.argv[1])").unwrap()).unwrap();
+    }
+
+    #[test]
+    fn wildcard_imports_are_distinct_from_named_imports() {
+        let program = parse(lex("from math import *").unwrap()).unwrap();
+        assert!(matches!(&program.statements[0].kind,
+            StatementKind::ImportStar { module } if module == "math"));
+        for source in [
+            "from math import *, sin",
+            "from math import sin, *",
+            "from math import (*)",
+            "from math import * as m",
+        ] {
+            assert!(parse(lex(source).unwrap()).is_err(), "{source}");
+        }
     }
 
     #[test]

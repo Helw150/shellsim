@@ -472,3 +472,15 @@ fn block_selection_work_is_cpu_bounded_and_cycles_are_rejected() {
     assert_ne!(status, 0);
     assert!(String::from_utf8_lossy(&stderr).contains("block nesting"));
 }
+
+#[test]
+fn trace_meters_diagonal_work_on_large_broadcast_views() {
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import numpy as np\na = np.broadcast_to(np.array(1), (1000000, 1000000))\nprint('ready')\na.trace()",
+        Limits { cpu: 100_000, ..Limits::unlimited() },
+    );
+    assert_eq!(stdout, b"ready\n");
+    assert_eq!(status, 137);
+    assert_eq!(usage.cpu_used, 100_000);
+    assert!(stderr.is_empty());
+}

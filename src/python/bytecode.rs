@@ -189,6 +189,7 @@ pub enum Opcode {
         name: NameId,
         bind_root: bool,
     },
+    ImportStar,
     LoadAttribute(NameId),
     LoadSubscript,
     BuildSlice {
@@ -268,6 +269,7 @@ pub enum Operation {
         name: String,
         bind_root: bool,
     },
+    ImportStar,
     LoadAttribute(String),
     LoadSubscript,
     BuildSlice {
@@ -397,6 +399,7 @@ impl CodeBuilder {
                 name: self.name(name),
                 bind_root,
             },
+            Operation::ImportStar => Opcode::ImportStar,
             Operation::LoadAttribute(name) => Opcode::LoadAttribute(self.name(name)),
             Operation::LoadSubscript => Opcode::LoadSubscript,
             Operation::BuildSlice {

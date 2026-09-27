@@ -932,6 +932,7 @@ dependencies = [
  "flate2",
  "glob",
  "libc",
+ "libm",
  "md-5",
  "num-bigint",
  "num-traits",

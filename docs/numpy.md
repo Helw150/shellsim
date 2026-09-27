@@ -61,7 +61,7 @@ The supported surface includes:
   functions, `minimum`, `maximum`, `clip`, and `where`, all with scalar and array broadcasting;
 - `concatenate`, `stack`, `vstack`, `hstack`, `kron`, and nested-list `block`;
 - `round` (also `around` and `ndarray.round`) with decimal scaling and ties to even;
-- `sum`, `prod`, `mean`, `min`, `max`, `var`, `std`, `median`, `all`, `any`, `dot`, and
+- `trace`, `sum`, `prod`, `mean`, `min`, `max`, `var`, `std`, `median`, `all`, `any`, `dot`, and
   `argmin`, `argmax`, cumulative sums and products, `inner`, `outer`, and two-dimensional
   `matmul`;
 - module functions that delegate to the corresponding array behavior.
@@ -116,6 +116,11 @@ floating-point rounding limitations. Boolean rounding and the `out` argument are
 `kron` promotes operand ranks with leading singleton axes. `block` accepts nonempty nested lists
 with consistent leaf depth and joins along successive trailing axes; tuples are rejected.
 Both composition operations support complex values and reserve storage before output growth.
+
+`trace` (also `ndarray.trace`) sums diagonals with an offset and two distinct axes, retaining
+unselected axes in order. It uses the same widening rules as `sum`, supports complex input, and
+accepts an explicit accumulator dtype through the existing checked conversion rules. `out` is
+unsupported; scalar results are NumPy scalars.
 
 Explicitly unsupported are `float16`, `complex64`, NumPy's C ABI, buffers,
 structured/object/string dtypes, masked arrays, arrays above 64 dimensions, multidimensional slice

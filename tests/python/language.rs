@@ -370,3 +370,94 @@ print(counter(), counter())"#;
     assert_eq!(stdout, b"41 42\n");
     assert!(stderr.is_empty());
 }
+
+#[test]
+fn wildcard_module_imports_bind_all_public_names() {
+    let source = r#"from math import *
+print(cos(0), sin(0))
+"#;
+    assert_eq!(
+        super::support::run_python_text(source),
+        (0, "1.0 0.0\n".into(), String::new())
+    );
+}
+
+#[test]
+fn wildcard_import_honors_all_and_excludes_private_names() {
+    let mut environment = Environment::new();
+    for (path, source) in [
+        ("/public.py", "value = 7\n_private = 9\n"),
+        (
+            "/explicit.py",
+            "__all__ = ['_private']\n_private = 11\nother = 12\n",
+        ),
+        ("/bad.py", "__all__ = [7]\n"),
+        ("/missing.py", "__all__ = ['absent']\n"),
+    ] {
+        environment
+            .vfs
+            .put_file(path, source.as_bytes().to_vec(), 0o644)
+            .unwrap();
+    }
+    let source = r#"from public import *
+assert value == 7
+assert '_private' not in dir()
+from explicit import *
+assert _private == 11
+assert 'other' not in dir()
+try:
+    from bad import *
+    assert False
+except TypeError:
+    pass
+try:
+    from missing import *
+    assert False
+except AttributeError:
+    pass
+print('ok')
+"#;
+    assert_eq!(
+        super::support::run_python_in(&mut environment, source),
+        (0, b"ok\n".to_vec(), Vec::new())
+    );
+    for source in [
+        "def f():\n    from math import *\nf()",
+        "class C:\n    from math import *",
+    ] {
+        let (status, _, stderr) = super::support::run_python_text(source);
+        assert_ne!(status, 0);
+        assert!(stderr.contains("import * only allowed at module level"));
+    }
+}
+
+#[test]
+fn wildcard_export_snapshots_obey_memory_limits() {
+    let mut environment = Environment::with_limits(shellsim::Limits {
+        cpu: 10_000_000,
+        memory: 128 * 1024,
+        disk: 1024 * 1024,
+        output: 1024,
+    });
+    environment.vfs.put_file("/exports.py", b"def names():\n    while True:\n        yield 'value'\nvalue = 1\n__all__ = names()\nprint('ready')\n".to_vec(), 0o644).unwrap();
+    let (status, stdout, stderr) =
+        super::support::run_python_in(&mut environment, "from exports import *");
+    assert_eq!(stdout, b"ready\n");
+    assert_eq!(status, 137);
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn builtin_format_reserves_width_before_allocating_padding() {
+    let mut environment = Environment::with_limits(shellsim::Limits {
+        cpu: 10_000_000,
+        memory: 128 * 1024,
+        disk: 1024 * 1024,
+        output: 1024,
+    });
+    let (status, stdout, stderr) =
+        super::support::run_python_in(&mut environment, "print('ready')\nformat(1, '1000000')");
+    assert_eq!(stdout, b"ready\n");
+    assert_eq!(status, 137);
+    assert!(stderr.is_empty());
+}

@@ -395,7 +395,10 @@ impl Vm<'_> {
                         return Ok(());
                     }
                     Object::Property { setter: None, .. } => {
-                        return Err(format!("property {name:?} has no setter"));
+                        return Err(self.record_native_error(PyError::exception(
+                            "AttributeError",
+                            format!("property {name:?} has no setter"),
+                        )));
                     }
                     Object::Instance {
                         class: descriptor_class,
@@ -1731,6 +1734,48 @@ impl Vm<'_> {
                 builtin_type.name()
             ));
         }
+        // User numeric classes (including frozen Fraction) participate in explicit conversions.
+        if arguments.len() == 1 && matches!(builtin_type, BuiltinType::Int | BuiltinType::Float) {
+            let receiver = arguments[0];
+            if receiver
+                .object_id()
+                .is_some_and(|id| matches!(self.state.heap.get(id), Ok(Object::Instance { .. })))
+            {
+                let method = if builtin_type == BuiltinType::Int {
+                    "__int__"
+                } else {
+                    "__float__"
+                };
+                let id = receiver.object_id().expect("checked instance");
+                let Object::Instance { class, .. } = self.state.heap.get(id)? else {
+                    unreachable!()
+                };
+                let class = *class;
+                if let Some((defining_class, descriptor)) =
+                    self.class_attribute_entry(class, method)?
+                {
+                    let callable =
+                        self.bind_descriptor(descriptor, Some(receiver), class, defining_class)?;
+                    let value = self.invoke_value(callable, Vec::new())?;
+                    let valid = match super::number::view(&self.state.heap, &value) {
+                        Some(
+                            super::number::NumberRef::Int(_) | super::number::NumberRef::BigInt(_),
+                        ) => builtin_type == BuiltinType::Int,
+                        Some(super::number::NumberRef::Float(_)) => {
+                            builtin_type == BuiltinType::Float
+                        }
+                        _ => false,
+                    };
+                    if !valid {
+                        return Err(self.record_native_error(PyError::type_error(format!(
+                            "{method} returned a non-{}",
+                            builtin_type.name()
+                        ))));
+                    }
+                    return Ok(CallResult::Value(value));
+                }
+            }
+        }
         let value = match builtin_type {
             BuiltinType::Type => match arguments.as_slice() {
                 [value] => self.type_of(value)?,
@@ -1794,6 +1839,21 @@ impl Vm<'_> {
                             let decimal = super::number::parse_integer_text(&text, 10)
                                 .map_err(|error| self.record_native_error(error))?;
                             self.new_integer(&decimal)
+                                .map_err(|error| self.record_native_error(error))?
+                        }
+                        Some(value) if value.float_value().is_some() => {
+                            let float = value.float_value().expect("guarded");
+                            if !float.is_finite() {
+                                let error = if float.is_nan() {
+                                    PyError::value_error("cannot convert float NaN to integer")
+                                } else {
+                                    PyError::overflow_error(
+                                        "cannot convert float infinity to integer",
+                                    )
+                                };
+                                return Err(self.record_native_error(error));
+                            }
+                            self.new_integer(&format!("{:.0}", float.trunc()))
                                 .map_err(|error| self.record_native_error(error))?
                         }
                         Some(value) => Value::Int(

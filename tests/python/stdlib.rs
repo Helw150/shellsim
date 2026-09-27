@@ -570,3 +570,138 @@ except TypeError:
 "#;
     assert_eq!(run(source), (0, b"math domain error\nmath domain error\nmath domain error\nmath domain error\nmath range error\nmath range error\narity\n".to_vec(), Vec::new()));
 }
+
+#[test]
+fn math_gamma_functions_match_cpython() {
+    let (status, stdout, stderr) = run("import math\nprint(math.gamma(5), math.lgamma(5))");
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert!(stderr.is_empty());
+    let values = String::from_utf8(stdout)
+        .unwrap()
+        .split_whitespace()
+        .map(|text| text.parse::<f64>().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0], 24.0);
+    assert!((values[1] - 3.1780538303479444).abs() <= 2.0 * f64::EPSILON * 3.1780538303479444);
+}
+
+#[test]
+fn fractions_module_supports_exact_rational_arithmetic() {
+    let source = r#"from fractions import Fraction
+print(Fraction(1, 3) + Fraction(1, 6))
+print(Fraction(2, 4))
+print(Fraction(1, 3) * 3)"#;
+    assert_eq!(run(source), (0, b"1/2\n1/2\n1\n".to_vec(), Vec::new()));
+}
+
+#[test]
+fn gamma_domains_infinities_and_range_errors_match_python() {
+    let source = r#"import math
+assert abs(math.gamma(0.5) - math.sqrt(math.pi)) < 1e-14
+assert abs(math.gamma(-0.5) + 2 * math.sqrt(math.pi)) < 1e-14
+assert abs(math.lgamma(-0.5) - math.log(2 * math.sqrt(math.pi))) < 1e-14
+assert math.gamma(math.inf) == math.inf
+assert math.lgamma(-math.inf) == math.inf
+assert math.isnan(math.gamma(math.nan))
+assert math.isnan(math.lgamma(math.nan))
+for fn in [math.gamma, math.lgamma]:
+    for x in [0.0, -0.0, -1.0, -2.0]:
+        try:
+            fn(x)
+            assert False
+        except ValueError:
+            pass
+    try:
+        fn(1, 2)
+        assert False
+    except TypeError:
+        pass
+try:
+    math.gamma(-math.inf)
+    assert False
+except ValueError:
+    pass
+for fn, x in [(math.gamma, 172.0), (math.lgamma, 1e308)]:
+    try:
+        fn(x)
+        assert False
+    except OverflowError:
+        pass
+print('ok')
+"#;
+    assert_eq!(run(source), (0, b"ok\n".to_vec(), Vec::new()));
+}
+
+#[test]
+fn fractions_normalize_construct_compare_and_mix_with_numbers() {
+    // Expected values checked against CPython 3.14's fractions module.
+    let source = r#"from fractions import Fraction as F
+assert F() == 0
+assert str(F(2, -4)) == '-1/2'
+assert repr(F(2, 4)) == 'Fraction(1, 2)'
+assert F(F(1, 3), F(2, 3)) == F(1, 2)
+assert F(' -1.25e-2 ') == F(-1, 80)
+assert F('1_000 / 2') == 500
+assert F('.125') == F(1, 8)
+assert F(0.1).as_integer_ratio() == (3602879701896397, 36028797018963968)
+assert F(1e100).denominator == 1
+assert F(5e-324).denominator == 2**1074
+assert F(0.1) != F(1, 10)
+assert F(1, 3) < 0.5 and 0.5 > F(1, 3)
+assert F(1, 2) == 0.5
+assert not F(0) and bool(F(1, 3))
+assert F(2, 3) - F(1, 6) == F(1, 2)
+assert 1 - F(1, 3) == F(2, 3)
+assert 3 * F(1, 3) == 1
+assert F(1, 3) / 2 == F(1, 6)
+assert 2 / F(1, 3) == 6
+assert F(-7, 3) // 2 == -2
+assert F(-7, 3) % 2 == F(5, 3)
+assert F(2, 3)**-2 == F(9, 4)
+assert abs(-F(1, 3)) == F(1, 3)
+assert int(F(-7, 3)) == -2
+assert float(F(1, 2)) == 0.5
+assert F(1, 2) + 0.25 == 0.75
+assert F('3.1415926535897932').limit_denominator(1000) == F(355, 113)
+for value in ['1__2', '1/2/3', 'nan', '1/-2', '1.2.3', '']:
+    try:
+        F(value)
+        assert False
+    except ValueError:
+        pass
+for args in [(1, 0), (0, 0)]:
+    try:
+        F(*args)
+        assert False
+    except ZeroDivisionError:
+        pass
+try:
+    F(1.5, 2)
+    assert False
+except TypeError:
+    pass
+try:
+    F(1, 2).numerator = 3
+    assert False
+except AttributeError:
+    pass
+print('ok')
+"#;
+    assert_eq!(run(source), (0, b"ok\n".to_vec(), Vec::new()));
+}
+
+#[test]
+fn fraction_arithmetic_remains_resource_bounded() {
+    let mut environment = Environment::with_limits(shellsim::Limits {
+        cpu: 1_000_000,
+        memory: 256 * 1024,
+        disk: 1024 * 1024,
+        output: 1024,
+    });
+    let source = "from fractions import Fraction\nx = Fraction(1, 3)\nprint('ready')\nwhile True:\n    x = x * x";
+    let (status, stdout, stderr) = run_in(&mut environment, source);
+    assert_eq!(stdout, b"ready\n");
+    assert_eq!(status, 137);
+    assert!(stderr.is_empty());
+}
