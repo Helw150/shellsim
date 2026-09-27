@@ -229,6 +229,9 @@ impl Vm<'_> {
         }
         if let Some(NativeValue::BuiltinType(builtin)) = owner.native_value() {
             if let Some(value) = self.state.types.attribute(builtin.id(), name)? {
+                if let Some(NativeValue::NativeClassMethod(method)) = value.native_value() {
+                    return self.bind_native_class_method(owner, method).map(Some);
+                }
                 return Ok(Some(value));
             }
         }
@@ -256,6 +259,10 @@ impl Vm<'_> {
                     owner: None,
                 })?;
                 return Ok(Some(bound));
+            }
+            Some(NativeValue::NativeClassMethod(method)) => {
+                let class = self.state.types.value(owner_type)?;
+                return self.bind_native_class_method(class, method).map(Some);
             }
             // Native getters are data descriptors. Builtin receivers have no instance
             // dictionary, so reaching the type table first already gives CPython precedence.
@@ -1431,6 +1438,19 @@ impl Vm<'_> {
         })
     }
 
+    /// Bind a native class method to `class`, which the method receives in place of an instance.
+    fn bind_native_class_method(
+        &mut self,
+        class: Value,
+        method: &'static super::super::native::MethodDef,
+    ) -> Result<Value, String> {
+        self.allocate_object(Object::DescriptorBoundMethod {
+            receiver: class,
+            descriptor: Value::Native(NativeValue::NativeMethod(method)),
+            owner: None,
+        })
+    }
+
     pub(super) fn bind_descriptor(
         &mut self,
         descriptor: Value,
@@ -1503,7 +1523,11 @@ impl Vm<'_> {
         }
     }
 
-    fn invoke_value(&mut self, callable: Value, arguments: Vec<Value>) -> Result<Value, String> {
+    pub(super) fn invoke_value(
+        &mut self,
+        callable: Value,
+        arguments: Vec<Value>,
+    ) -> Result<Value, String> {
         match self.invoke_call(callable, arguments, Vec::new())? {
             CallResult::Value(value) => Ok(value),
             CallResult::Exit(status) => Err(format!("callable exited with status {status}")),
@@ -2079,7 +2103,9 @@ impl Vm<'_> {
                 .value_kind_type_id_by_index(value.registered_parts().expect("tag checked").0)
                 .ok_or("invalid registered value kind")?,
             ValueTag::Native => match value.native_value().expect("native tag checked") {
-                NativeValue::BuiltinType(_) | NativeValue::ValueKind(_) => BuiltinType::Type.id(),
+                NativeValue::BuiltinType(_)
+                | NativeValue::ValueKind(_)
+                | NativeValue::ExceptionType(_) => BuiltinType::Type.id(),
                 NativeValue::Function(_)
                 | NativeValue::NativeFunction(_)
                 | NativeValue::NativeMethod(_) => BuiltinType::Function.id(),

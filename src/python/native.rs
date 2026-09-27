@@ -500,6 +500,9 @@ pub(super) trait PyRuntime {
     fn set_is_frozen(&self, set: PySet) -> PyResult<bool>;
     fn set_insert(&mut self, set: PySet, value: PyValue) -> PyResult<bool>;
     fn set_remove(&mut self, set: PySet, value: &PyValue) -> PyResult<bool>;
+    /// Replace a mutable set's members with already-deduplicated `items`, metering the change
+    /// in retained size. Frozen sets are rejected.
+    fn replace_set_items(&mut self, set: PySet, items: Vec<PyValue>) -> PyResult<()>;
     fn replace_list_items(&mut self, list: PyList, items: Vec<PyValue>) -> PyResult<()>;
     fn call_value(&mut self, callable: PyValue, args: CallArgs) -> PyResult<PyValue>;
     fn is_callable(&self, value: &PyValue) -> PyResult<bool>;
@@ -624,6 +627,9 @@ pub(super) trait PyRuntime {
     fn filesystem(&mut self) -> &mut dyn PyFilesystem;
     fn http(&mut self) -> &mut dyn PyHttpClient;
     fn processes(&mut self) -> &mut dyn PyProcessRunner;
+    /// The script path and source line executing `depth` Python frames below the innermost one,
+    /// or `None` when the stack is shallower. Depth 0 is the innermost frame.
+    fn caller_location(&self, depth: usize) -> Option<(String, u32)>;
     /// PID of the logical process running this Python interpreter.
     fn current_pid(&self) -> u32;
     /// PID of the logical parent of the process running this Python interpreter.
