@@ -9,7 +9,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
 
-use super::heap::ObjectId;
+use super::heap::{DictViewKind, ObjectId};
 use super::Value;
 
 /// The erased value exchanged by native modules and the VM.
@@ -293,8 +293,6 @@ pub(super) enum PyNativeKind {
     RaisesContext,
     Property,
     Array,
-    /// `globals()`'s live namespace view.
-    Globals,
 }
 
 /// Module-owned element type of an array, opaque to the runtime except for its storage needs.
@@ -716,12 +714,17 @@ pub(super) trait PyRuntime {
     fn replace_dict_items(&mut self, dict: PyDict, items: Vec<(PyValue, PyValue)>) -> PyResult<()>;
     /// A shallow copy of `dict` of the same kind: a `defaultdict` copy keeps its factory.
     fn dict_copy(&mut self, dict: PyDict) -> PyResult<PyValue>;
-    /// Every `(name, value)` binding a `globals()` view currently holds, sorted by name for a
-    /// deterministic order. Names are freshly allocated strings.
-    fn globals_items(&mut self, globals: PyGlobals) -> PyResult<Vec<(PyValue, PyValue)>>;
-    fn globals_get(&mut self, globals: PyGlobals, name: &str) -> PyResult<Option<PyValue>>;
-    fn globals_insert(&mut self, globals: PyGlobals, name: String, value: PyValue) -> PyResult<()>;
-    fn globals_remove(&mut self, globals: PyGlobals, name: &str) -> PyResult<Option<PyValue>>;
+    /// `container[key]`, running the container's `__getitem__` or builtin subscript.
+    fn get_item(&mut self, container: PyValue, key: PyValue) -> PyResult<PyValue>;
+    /// The `(key, value)` entries of `value` if it is a mapping, or `None` when it has no
+    /// `keys` method. Mappings other than dicts are read through `keys()` and `__getitem__`, as
+    /// `dict(m)` and `f(**m)` read them in CPython.
+    fn mapping_items(&mut self, value: PyValue) -> PyResult<Option<Vec<(PyValue, PyValue)>>>;
+    /// A live `keys()`, `values()` or `items()` view of `mapping`, which is a dict, a namespace
+    /// view or a mapping proxy.
+    fn new_dict_view(&mut self, kind: DictViewKind, mapping: PyValue) -> PyResult<PyValue>;
+    /// The projection and viewed mapping of a dict view, or `None` when `value` is not one.
+    fn dict_view(&self, value: &PyValue) -> PyResult<Option<(DictViewKind, PyValue)>>;
     fn set_items(&mut self, set: PySet) -> PyResult<Vec<PyValue>>;
     fn set_is_frozen(&self, set: PySet) -> PyResult<bool>;
     fn set_insert(&mut self, set: PySet, value: PyValue) -> PyResult<bool>;
@@ -1374,29 +1377,6 @@ impl PyDict {
     /// Snapshot entries so callers do not retain an arena borrow across Python work.
     pub fn items(self, runtime: &mut dyn PyRuntime) -> PyResult<Vec<(PyValue, PyValue)>> {
         runtime.dict_items(self)
-    }
-}
-
-/// Checked handle to a `globals()` namespace view.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct PyGlobals(ObjectId);
-
-impl PyGlobals {
-    pub(super) fn object_id(self) -> ObjectId {
-        self.0
-    }
-}
-
-impl FromPyValue for PyGlobals {
-    fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
-        let Some(id) = value.object_id() else {
-            return Err(PyError::type_error("expected a globals() mapping"));
-        };
-        if runtime.native_kind(&Value::Object(id))? == Some(PyNativeKind::Globals) {
-            Ok(Self(id))
-        } else {
-            Err(PyError::type_error("expected a globals() mapping"))
-        }
     }
 }
 

@@ -6,6 +6,7 @@
 //! `__hash__` makes the class unhashable, and everything else hashes by identity.
 
 use super::super::hash;
+use super::super::heap::DictViewKind;
 use super::super::number::{self, NumberRef};
 use super::{protocol, Object, Slot, Value, ValueTag, Vm};
 
@@ -74,7 +75,13 @@ impl Vm<'_> {
             | Object::Dict(_)
             | Object::DefaultDict { .. }
             | Object::Set(_)
-            | Object::ByteArray(_) => return Err(self.unhashable(value)),
+            | Object::ByteArray(_)
+            | Object::NamespaceDict(_)
+            | Object::MappingProxy(_)
+            | Object::DictView {
+                kind: DictViewKind::Keys | DictViewKind::Items,
+                ..
+            } => return Err(self.unhashable(value)),
             Object::Instance { class, .. } => {
                 let class = *class;
                 return self.instance_hash(value, class);

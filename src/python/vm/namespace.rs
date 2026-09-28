@@ -2,7 +2,7 @@
 
 use super::{
     cpython_names, exception_types, protocol, Arc, BuiltinType, CodeRef, ExceptionType, Execution,
-    GlobalsTarget, HashMap, NameId, NativeValue, Object, ObjectId, PyModuleLoader, PyRuntime,
+    HashMap, NameId, NamespaceTarget, NativeValue, Object, ProxyTarget, PyModuleLoader, PyRuntime,
     RaisedException, ScopeId, SymbolId, Value, Vm, BUILTIN_FUNCTIONS,
 };
 
@@ -379,94 +379,205 @@ impl Vm<'_> {
     /// (the entry-point program) or the root scope defers to it (a function or class body defined
     /// at that program's top level). Mirrors `load_global`'s and `store_global`'s resolution
     /// exactly, so `globals()` always names the same namespace a bare name lookup would.
-    pub(super) fn current_globals_target(&self) -> Result<GlobalsTarget, String> {
+    pub(super) fn current_globals_target(&self) -> Result<NamespaceTarget, String> {
         let Some(scope) = self.local_scopes.last().copied() else {
-            return Ok(GlobalsTarget::Repl);
+            return Ok(NamespaceTarget::Repl);
         };
         let root = self.state.heap.scope_root(scope)?;
         if self.state.heap.scope_uses_repl_globals(root)? {
-            Ok(GlobalsTarget::Repl)
+            Ok(NamespaceTarget::Repl)
         } else {
-            Ok(GlobalsTarget::Scope(root))
+            Ok(NamespaceTarget::Scope(root))
         }
     }
 
-    /// The target a live `globals()` handle refers to.
-    pub(super) fn globals_target(&self, id: ObjectId) -> Result<GlobalsTarget, String> {
-        match self.state.heap.get(id)? {
-            Object::Globals(target) => Ok(*target),
-            _ => Err("value is not a globals() mapping".into()),
+    /// `vars()` and `locals()` with no argument. At a module's or the script's top level this
+    /// is the same live view `globals()` returns, as `locals() is globals()` there in CPython.
+    /// Inside a function it is a detached `dict` of that call's local variables: CPython's
+    /// `locals()` there is a snapshot too, and writing to it never rebinds a local.
+    pub(super) fn current_locals(&mut self) -> Result<Value, String> {
+        let Some(scope) = self.local_scopes.last().copied() else {
+            return self.allocate_object(Object::NamespaceDict(NamespaceTarget::Repl));
+        };
+        // A module's own scope is the only one with no parent that does not defer to the
+        // REPL/script table; function calls either have a lexical parent or defer to it.
+        let is_module_scope = !self.state.heap.scope_uses_repl_globals(scope)?
+            && self.state.heap.scope_parent(scope)?.is_none();
+        if is_module_scope {
+            return self.allocate_object(Object::NamespaceDict(NamespaceTarget::Scope(scope)));
         }
+        self.namespace_snapshot_dict(NamespaceTarget::Scope(scope))
     }
 
-    /// Every binding a `globals()` target currently holds, sorted by name for a deterministic
-    /// order.
+    /// A detached `dict` holding `target`'s current bindings.
+    pub(super) fn namespace_snapshot_dict(
+        &mut self,
+        target: NamespaceTarget,
+    ) -> Result<Value, String> {
+        let items = self.namespace_items(target)?;
+        self.allocate_object(Object::Dict(items.into()))
+    }
+
+    /// `target`'s bindings as `(key, value)` pairs with freshly allocated string keys, in the
+    /// order [`Self::namespace_entries`] gives.
+    pub(super) fn namespace_items(
+        &mut self,
+        target: NamespaceTarget,
+    ) -> Result<Vec<(Value, Value)>, String> {
+        let entries = self.namespace_entries(target)?;
+        let mut items = Vec::with_capacity(entries.len());
+        for (name, value) in entries {
+            items.push((self.allocate_string(name)?, value));
+        }
+        Ok(items)
+    }
+
+    /// The entries of a class's or native module's read-only `__dict__`, sorted by name, with
+    /// freshly allocated string keys. Class attributes live in a `HashMap` and native modules
+    /// declare functions apart from values, so neither keeps CPython's definition order.
+    pub(super) fn proxy_items(
+        &mut self,
+        target: ProxyTarget,
+    ) -> Result<Vec<(Value, Value)>, String> {
+        let mut entries: Vec<(String, Value)> = match target {
+            ProxyTarget::Class(class) => {
+                let Object::Class { attributes, .. } = self.state.heap.get(class)? else {
+                    return Err("mappingproxy target is not a class".into());
+                };
+                attributes
+                    .iter()
+                    .map(|(name, value)| (name.clone(), *value))
+                    .collect()
+            }
+            ProxyTarget::NativeModule(module) => {
+                let mut entries = Vec::with_capacity(module.functions.len() + module.values.len());
+                for function in module.functions {
+                    let value = Value::Native(NativeValue::NativeFunction(function));
+                    entries.push((function.name.to_string(), value));
+                }
+                for definition in module.values {
+                    let value = definition.get(self).map_err(|error| error.to_string())?;
+                    entries.push((definition.name().to_string(), value));
+                }
+                entries
+            }
+        };
+        self.charge_cpu(u64::try_from(entries.len()).unwrap_or(u64::MAX))?;
+        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let mut items = Vec::with_capacity(entries.len());
+        for (name, value) in entries {
+            items.push((self.allocate_string(name)?, value));
+        }
+        Ok(items)
+    }
+
+    /// Every binding a namespace target currently holds, in a deterministic order.
     ///
-    /// Neither backing store can supply Python's per-dict insertion order cheaply: a module's own
-    /// scope keeps its dynamic bindings in a `HashMap`, and the REPL/script table is indexed by
-    /// interned symbol, not by name. Sorting by name keeps iteration, `keys()`, `values()`,
-    /// `items()` and `repr` deterministic instead.
-    pub(super) fn globals_snapshot(
+    /// Module and REPL/script namespaces are sorted by name. Neither backing store keeps
+    /// Python's insertion order cheaply: a module scope keeps its dynamic bindings in a
+    /// `HashMap`, and the REPL/script table is indexed by interned symbol. Instance attributes
+    /// come in the order [`Heap::instance_attribute_names`] gives.
+    ///
+    /// [`Heap::instance_attribute_names`]: super::super::heap::Heap::instance_attribute_names
+    pub(super) fn namespace_entries(
         &self,
-        target: GlobalsTarget,
+        target: NamespaceTarget,
     ) -> Result<Vec<(String, Value)>, String> {
         let mut entries: Vec<(String, Value)> = match target {
-            GlobalsTarget::Scope(scope) => {
+            NamespaceTarget::Scope(scope) => {
                 self.state.heap.scope_values(scope)?.into_iter().collect()
             }
-            GlobalsTarget::Repl => self.state.globals.entries(&self.state.heap),
+            NamespaceTarget::Repl => self.state.globals.entries(&self.state.heap),
+            NamespaceTarget::Instance(id) => {
+                let mut entries = Vec::new();
+                for name in self.state.heap.instance_attribute_names(id)? {
+                    if let Some(value) = self.namespace_lookup(target, &name)? {
+                        entries.push((name, value));
+                    }
+                }
+                return Ok(entries);
+            }
         };
         entries.sort_by(|(left, _), (right, _)| left.cmp(right));
         Ok(entries)
     }
 
-    pub(super) fn globals_lookup(&self, target: GlobalsTarget, name: &str) -> Option<Value> {
-        match target {
-            GlobalsTarget::Scope(scope) => self.state.heap.scope_get(scope, name).copied(),
-            GlobalsTarget::Repl => {
-                let symbol = self.state.heap.symbol_id(name)?;
-                self.state.globals.get(symbol)
-            }
+    pub(super) fn namespace_lookup(
+        &self,
+        target: NamespaceTarget,
+        name: &str,
+    ) -> Result<Option<Value>, String> {
+        if let NamespaceTarget::Scope(scope) = target {
+            return Ok(self.state.heap.scope_get(scope, name).copied());
         }
+        // REPL/script names and instance attributes are keyed by interned symbol, so a name that
+        // was never interned is not bound there.
+        let Some(symbol) = self.state.heap.symbol_id(name) else {
+            return Ok(None);
+        };
+        Ok(match target {
+            NamespaceTarget::Repl => self.state.globals.get(symbol),
+            NamespaceTarget::Instance(id) => {
+                self.state.heap.attribute_by_symbol(id, symbol)?.copied()
+            }
+            NamespaceTarget::Scope(_) => unreachable!("scope targets returned above"),
+        })
     }
 
-    pub(super) fn globals_store(
+    /// Bind `name` in `target`. An instance write goes straight to the instance's own
+    /// attributes, bypassing `__setattr__` and descriptors, as a write to CPython's
+    /// `obj.__dict__` does.
+    pub(super) fn namespace_store(
         &mut self,
-        target: GlobalsTarget,
+        target: NamespaceTarget,
         name: String,
         value: Value,
     ) -> Result<(), String> {
+        if let NamespaceTarget::Scope(scope) = target {
+            return self
+                .state
+                .heap
+                .scope_insert(scope, name, value, &mut self.interp.resources);
+        }
+        let symbol = self
+            .state
+            .heap
+            .intern_symbol(&name, &mut self.interp.resources)?;
         match target {
-            GlobalsTarget::Scope(scope) => {
-                self.state
-                    .heap
-                    .scope_insert(scope, name, value, &mut self.interp.resources)
-            }
-            GlobalsTarget::Repl => {
-                let symbol = self
-                    .state
-                    .heap
-                    .intern_symbol(&name, &mut self.interp.resources)?;
+            NamespaceTarget::Repl => {
                 self.state
                     .globals
                     .insert(symbol, value, &mut self.interp.resources)
             }
+            NamespaceTarget::Instance(id) => self.state.heap.insert_attribute_by_symbol(
+                id,
+                symbol,
+                value,
+                &mut self.interp.resources,
+            ),
+            NamespaceTarget::Scope(_) => unreachable!("scope targets returned above"),
         }
     }
 
-    pub(super) fn globals_delete(
+    pub(super) fn namespace_delete(
         &mut self,
-        target: GlobalsTarget,
+        target: NamespaceTarget,
         name: &str,
     ) -> Result<Option<Value>, String> {
+        if let NamespaceTarget::Scope(scope) = target {
+            return self.state.heap.scope_remove(scope, name);
+        }
+        let Some(symbol) = self.state.heap.symbol_id(name) else {
+            return Ok(None);
+        };
         match target {
-            GlobalsTarget::Scope(scope) => self.state.heap.scope_remove(scope, name),
-            GlobalsTarget::Repl => {
-                let Some(symbol) = self.state.heap.symbol_id(name) else {
-                    return Ok(None);
-                };
-                Ok(self.state.globals.remove(symbol))
+            NamespaceTarget::Repl => Ok(self.state.globals.remove(symbol)),
+            NamespaceTarget::Instance(id) => {
+                self.state
+                    .heap
+                    .remove_attribute_by_symbol(id, symbol, &mut self.interp.resources)
             }
+            NamespaceTarget::Scope(_) => unreachable!("scope targets returned above"),
         }
     }
 

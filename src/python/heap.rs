@@ -109,18 +109,40 @@ impl ObjectId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ScopeId(usize);
 
-/// Where a `globals()` view's bindings actually live.
+/// Where a namespace view's bindings actually live. `globals()`, `vars()` and `obj.__dict__`
+/// return an [`Object::NamespaceDict`] over one of these, and every read and write through the
+/// view acts on this storage.
 ///
 /// An imported module's top-level code runs with its own lexical [`Scope`] (`uses_repl_globals`
-/// false), so `globals()` there is a live view of that scope. The entry-point script or an
-/// interactive REPL line runs with no scope of its own; its names, and those of any function or
-/// class body defined at that top level, live in the flat REPL/script table instead (see
-/// `ReplState::globals` and `Vm::scope_uses_repl_globals`). Keeping both cases in one type lets a
-/// single `globals()` implementation cover them without changing how either namespace is stored.
+/// false), so its namespace is that scope. The entry-point script or an interactive REPL line runs
+/// with no scope of its own; its names, and those of any function or class body defined at that
+/// top level, live in the flat REPL/script table instead (see `ReplState::globals` and
+/// `Vm::scope_uses_repl_globals`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GlobalsTarget {
+pub enum NamespaceTarget {
+    /// A module's own scope.
     Scope(ScopeId),
+    /// The script and REPL global table.
     Repl,
+    /// One instance's own attributes, for `obj.__dict__` and `vars(obj)`.
+    Instance(ObjectId),
+}
+
+/// Which projection of a mapping a [`Object::DictView`] presents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DictViewKind {
+    Keys,
+    Values,
+    Items,
+}
+
+/// What a [`Object::MappingProxy`] reads: a namespace that shellsim exposes read-only.
+#[derive(Clone, Copy, Debug)]
+pub enum ProxyTarget {
+    /// A class's own attributes, for `cls.__dict__` and `vars(cls)`.
+    Class(ObjectId),
+    /// A native module's functions and values, which cannot be rebound.
+    NativeModule(&'static super::native::ModuleDef),
 }
 
 #[derive(Clone, Debug)]
@@ -259,10 +281,18 @@ pub enum Object {
         name: String,
         scope: ScopeId,
     },
-    /// `globals()`: a live view over the namespace of the module whose code is running, backed by
-    /// [`GlobalsTarget`]. Reads, writes and deletes through it act on the same storage a bare name
-    /// lookup would.
-    Globals(GlobalsTarget),
+    /// A live, dict-like view over a [`NamespaceTarget`]: what `globals()`, `vars()` and
+    /// `obj.__dict__` return. Reads, writes and deletes through it act on the same storage that
+    /// name and attribute lookups use.
+    NamespaceDict(NamespaceTarget),
+    /// `dict.keys()`, `dict.values()` or `dict.items()`: a live view that reads `mapping`'s
+    /// current entries on every use. `mapping` is a dict, a namespace view or a mapping proxy.
+    DictView {
+        kind: DictViewKind,
+        mapping: ObjectId,
+    },
+    /// A read-only mapping over a [`ProxyTarget`], like CPython's `mappingproxy`.
+    MappingProxy(ProxyTarget),
     /// Flat element storage shared by one or more array views: packed bytes, or traced Python
     /// references for object arrays.
     ArrayStorage(PyArrayBuffer),
@@ -451,6 +481,8 @@ impl Heap {
     }
 
     /// Snapshot the names stored directly on an instance in either attribute representation.
+    /// Shaped instances list names in the order they were first assigned; dictionary instances
+    /// (after a deletion or many attributes) list them sorted, since their storage is unordered.
     pub fn instance_attribute_names(&self, id: ObjectId) -> Result<Vec<String>, String> {
         let object = self
             .objects
@@ -471,14 +503,18 @@ impl Heap {
                         .ok_or_else(|| "invalid instance attribute symbol".into())
                 })
                 .collect(),
-            InstanceAttributes::Dictionary(values) => values
-                .keys()
-                .map(|symbol| {
-                    self.symbol_name(*symbol)
-                        .map(str::to_string)
-                        .ok_or_else(|| "invalid instance attribute symbol".into())
-                })
-                .collect(),
+            InstanceAttributes::Dictionary(values) => {
+                let mut names = values
+                    .keys()
+                    .map(|symbol| {
+                        self.symbol_name(*symbol)
+                            .map(str::to_string)
+                            .ok_or_else(|| String::from("invalid instance attribute symbol"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                names.sort();
+                Ok(names)
+            }
         }
     }
 
@@ -1248,7 +1284,13 @@ impl Heap {
             | Object::StreamIterator { .. } => BuiltinType::Iterator.id(),
             Object::Generator { .. } => BuiltinType::Generator.id(),
             Object::Module { .. } => BuiltinType::Module.id(),
-            Object::Globals(_) => BuiltinType::Globals.id(),
+            Object::NamespaceDict(_) => BuiltinType::NamespaceDict.id(),
+            Object::DictView { kind, .. } => match kind {
+                DictViewKind::Keys => BuiltinType::DictKeys.id(),
+                DictViewKind::Values => BuiltinType::DictValues.id(),
+                DictViewKind::Items => BuiltinType::DictItems.id(),
+            },
+            Object::MappingProxy(_) => BuiltinType::MappingProxy.id(),
             Object::ArrayStorage(_) => BuiltinType::Native.id(),
             Object::Array { .. } => BuiltinType::Array.id(),
             Object::WideValue { type_id, .. } => *type_id,
@@ -1570,10 +1612,14 @@ fn trace_object(
             trace_value(*return_value, object_work);
         }
         Object::Module { scope, .. } => scope_work.push(*scope),
-        Object::Globals(GlobalsTarget::Scope(scope)) => scope_work.push(*scope),
+        Object::NamespaceDict(NamespaceTarget::Scope(scope)) => scope_work.push(*scope),
         // The REPL/script global table is already a GC root at every collection (see
         // `Vm::collect_heap`), so this handle owns nothing further to trace.
-        Object::Globals(GlobalsTarget::Repl) => {}
+        Object::NamespaceDict(NamespaceTarget::Repl) => {}
+        Object::NamespaceDict(NamespaceTarget::Instance(instance)) => object_work.push(*instance),
+        Object::DictView { mapping, .. } => object_work.push(*mapping),
+        Object::MappingProxy(ProxyTarget::Class(class)) => object_work.push(*class),
+        Object::MappingProxy(ProxyTarget::NativeModule(_)) => {}
         Object::Array { storage, base, .. } => {
             object_work.push(*storage);
             object_work.extend(*base);
@@ -1735,7 +1781,7 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
         Object::Module { name, .. } => name.len(),
         // The namespace it views is charged where that namespace actually lives (the scope or
         // the REPL/script global table), so the view itself is a fixed, minimal handle.
-        Object::Globals(_) => 1,
+        Object::NamespaceDict(_) | Object::DictView { .. } | Object::MappingProxy(_) => 1,
         Object::ArrayStorage(PyArrayBuffer::Bytes(bytes)) => return packed(bytes.len()),
         Object::ArrayStorage(PyArrayBuffer::Values(values)) => values.len(),
         Object::Array { view, .. } => view
