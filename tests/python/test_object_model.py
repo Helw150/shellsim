@@ -284,3 +284,513 @@ def test_builtin_functions_and_bound_methods_have_names():
     method = receiver.describe
     assert method.__name__ == "describe" and method.__func__ is Base.describe
     assert method.__self__ is receiver
+
+
+def test_getattr_runs_only_for_attributes_ordinary_lookup_misses():
+    class Dynamic:
+        real = "class attribute"
+
+        def __init__(self):
+            self.stored = "instance attribute"
+
+        @property
+        def computed(self):
+            return "property"
+
+        def __getattr__(self, name):
+            if name.startswith("dyn_"):
+                return name[4:]
+            raise AttributeError(f"no {name} here")
+
+    class Child(Dynamic):
+        pass
+
+    value = Dynamic()
+    assert (value.real, value.stored, value.computed) == ("class attribute", "instance attribute", "property")
+    assert value.dyn_x == "x" and value.dyn_y == "y" and Child().dyn_z == "z"
+    assert hasattr(value, "dyn_w") and not hasattr(value, "other")
+    assert getattr(value, "other", "default") == "default"
+    try:
+        missing = value.other
+    except AttributeError as error:
+        assert str(error) == "no other here"
+    else:
+        raise AssertionError(f"__getattr__'s AttributeError did not propagate: {missing!r}")
+
+    class Broken:
+        def __getattr__(self, name):
+            raise KeyError(name)
+
+    for probe in (lambda: Broken().x, lambda: hasattr(Broken(), "x")):
+        try:
+            probe()
+        except KeyError:
+            pass
+        else:
+            raise AssertionError("a non-AttributeError from __getattr__ must propagate")
+
+
+def test_setattr_receives_every_assignment_and_object_setattr_stores():
+    class Doubler:
+        def __setattr__(self, name, value):
+            object.__setattr__(self, name, value * 2)
+
+    class Inherits(Doubler):
+        pass
+
+    doubled = Doubler()
+    doubled.x = 2
+    doubled.y = 5
+    inherited = Inherits()
+    inherited.z = 21
+    assert (doubled.x, doubled.y, inherited.z) == (4, 10, 42)
+
+    class Validated:
+        def __init__(self):
+            self.count = 0
+
+        def __setattr__(self, name, value):
+            if value < 0:
+                raise ValueError("negative")
+            super().__setattr__(name, value)
+
+    validated = Validated()
+    validated.count = 3
+    try:
+        validated.count = -1
+    except ValueError:
+        pass
+    assert validated.count == 3
+
+    class Frozen:
+        def __init__(self, value):
+            object.__setattr__(self, "value", value)
+
+        def __setattr__(self, name, value):
+            raise AttributeError(f"cannot assign to field '{name}'")
+
+    frozen = Frozen(1)
+    try:
+        frozen.value = 2
+    except AttributeError as error:
+        assert str(error) == "cannot assign to field 'value'"
+    assert frozen.value == 1
+
+    class WithProperty:
+        def __init__(self):
+            self._x = 0
+
+        @property
+        def x(self):
+            return self._x
+
+        @x.setter
+        def x(self, value):
+            self._x = value + 100
+
+        def __setattr__(self, name, value):
+            object.__setattr__(self, name, value)
+
+    with_property = WithProperty()
+    with_property.x = 1
+    assert with_property.x == 101
+
+
+class PlainClass:
+    pass
+
+
+class MixedChild(PlainClass, ValueError):
+    pass
+
+
+class MixedGrandchild(MixedChild):
+    pass
+
+
+class Relocated:
+    __module__ = "elsewhere"
+
+
+class Movable:
+    pass
+
+
+class Unwritable:
+    @property
+    def fixed(self):
+        return 1
+
+
+def test_classes_record_their_module_bases_and_mro():
+    assert PlainClass.__module__ == __name__ and PlainClass().__module__ == __name__
+    assert repr(PlainClass) == f"<class '{__name__}.PlainClass'>"
+    assert PlainClass.__bases__ == (object,)
+    assert MixedChild.__bases__ == (PlainClass, ValueError)
+    assert MixedGrandchild.__mro__ == (
+        MixedGrandchild,
+        MixedChild,
+        PlainClass,
+        ValueError,
+        Exception,
+        BaseException,
+        object,
+    )
+    assert MixedGrandchild.mro() == list(MixedGrandchild.__mro__)
+    assert UserId.__mro__ == (UserId, int, object)
+    assert Relocated.__module__ == "elsewhere"
+    assert repr(Relocated) == "<class 'elsewhere.Relocated'>"
+    Movable.__module__ = "moved"
+    assert repr(Movable) == "<class 'moved.Movable'>"
+
+    def local():
+        pass
+
+    assert local.__module__ == __name__
+
+
+def test_builtin_types_report_their_module_bases_and_mro():
+    assert (int.__module__, ValueError.__module__, len.__module__) == ("builtins", "builtins", "builtins")
+    assert bool.__bases__ == (int,) and bool.__mro__ == (bool, int, object)
+    assert object.__bases__ == () and object.__mro__ == (object,)
+    assert KeyError.__bases__ == (LookupError,)
+    assert KeyError.__mro__ == (KeyError, LookupError, Exception, BaseException, object)
+    assert int.mro() == [int, object]
+
+
+def test_class_attributes_can_change_after_the_class_statement():
+    class Counter:
+        pass
+
+    class Derived(Counter):
+        pass
+
+    counter, derived = Counter(), Derived()
+    Counter.limit = 3
+    assert (Counter.limit, counter.limit, Derived.limit, derived.limit) == (3, 3, 3, 3)
+
+    # Special methods assigned later take effect for the class and its subclasses.
+    Counter.__eq__ = lambda self, other: other == "any"
+    assert counter == "any" and derived == "any"
+    del Counter.__eq__
+    assert counter != "any"
+    del Counter.limit
+    assert not hasattr(derived, "limit")
+    try:
+        del Counter.limit
+    except AttributeError as error:
+        assert str(error) == "type object 'Counter' has no attribute 'limit'"
+    else:
+        raise AssertionError("deleting a missing class attribute succeeded")
+
+    # A data descriptor added to the class takes precedence over an instance attribute that
+    # was already read.
+    def read(instance):
+        return instance.value
+
+    counter.value = 1
+    assert read(counter) == 1
+    Counter.value = property(lambda self: 99)
+    assert read(counter) == 99
+
+
+def test_del_and_delattr_remove_attributes_through_the_protocol():
+    class Recorder:
+        def __init__(self):
+            self.log = []
+
+        def __delattr__(self, name):
+            self.log.append(name)
+            object.__delattr__(self, name)
+
+    recorder = Recorder()
+    recorder.temporary = 1
+    del recorder.temporary
+    assert recorder.log == ["temporary"] and not hasattr(recorder, "temporary")
+    try:
+        delattr(recorder, "temporary")
+    except AttributeError as error:
+        assert str(error) == "'Recorder' object has no attribute 'temporary'"
+    else:
+        raise AssertionError("deleting a missing attribute succeeded")
+    assert recorder.log == ["temporary", "temporary"]
+
+    wide = PlainClass()
+    for index in range(20):
+        setattr(wide, f"field{index}", index)
+    del wide.field3
+    assert not hasattr(wide, "field3") and wide.field4 == 4
+
+    class Deletable:
+        def __init__(self):
+            self.deleted = []
+
+        def __get__(self, instance, owner=None):
+            return 7
+
+        def __set__(self, instance, value):
+            pass
+
+        def __delete__(self, instance):
+            self.deleted.append(instance)
+
+    descriptor = Deletable()
+
+    class Holder:
+        slot = descriptor
+
+    holder = Holder()
+    del holder.slot
+    assert descriptor.deleted == [holder]
+    for statement, message in [
+        (lambda: delattr(Unwritable(), "fixed"), "property 'fixed' of 'Unwritable' object has no deleter"),
+        (lambda: delattr(1, "x"), "'int' object has no attribute 'x' and no __dict__ for setting new attributes"),
+    ]:
+        try:
+            statement()
+        except AttributeError as error:
+            assert str(error) == message
+        else:
+            raise AssertionError(message)
+
+
+class Singleton:
+    instance = None
+
+    def __new__(cls):
+        if cls.instance is None:
+            cls.instance = super().__new__(cls)
+        return cls.instance
+
+
+class Tagged:
+    def __new__(cls, value):
+        instance = super().__new__(cls)
+        instance.tag = value * 2
+        return instance
+
+    def __init__(self, value):
+        self.value = value
+
+
+class TaggedChild(Tagged):
+    def __init__(self, value):
+        super().__init__(value)
+        self.child = True
+
+
+class StaticNew:
+    @staticmethod
+    def __new__(cls, *, name):
+        instance = object.__new__(cls)
+        instance.name = name
+        return instance
+
+
+class ReturnsOther:
+    initialized = []
+
+    def __new__(cls):
+        return 7
+
+    def __init__(self):
+        ReturnsOther.initialized.append(self)
+
+
+class ForwardsArguments:
+    def __new__(cls, *args):
+        return super().__new__(cls, *args)
+
+
+class NoInitializer:
+    pass
+
+
+def test_new_creates_the_instance_that_init_receives():
+    assert Singleton() is Singleton()
+    tagged = Tagged(3)
+    assert (tagged.tag, tagged.value) == (6, 3)
+    child = TaggedChild(4)
+    assert (child.tag, child.value, child.child, type(child)) == (8, 4, True, TaggedChild)
+    assert StaticNew(name="n").name == "n"
+    # `__init__` runs only when `__new__` returns an instance of the class.
+    assert ReturnsOther() == 7
+    assert ReturnsOther.initialized == []
+    assert type(object.__new__(Tagged)) is Tagged
+    assert NoInitializer.__new__ is object.__new__
+    assert NoInitializer.__init__ is object.__init__
+
+
+def test_object_new_rejects_arguments_nothing_accepts():
+    for operation, message in [
+        (lambda: ForwardsArguments(1), "object.__new__() takes exactly one argument (the type to instantiate)"),
+        (lambda: object.__new__(NoInitializer, 1), "NoInitializer() takes no arguments"),
+        (lambda: object.__new__(ValueError), "object.__new__(ValueError) is not safe, use ValueError.__new__()"),
+        (lambda: object.__new__(LegacyError), "object.__new__(LegacyError) is not safe, use LegacyError.__new__()"),
+    ]:
+        try:
+            operation()
+        except TypeError as error:
+            assert str(error) == message
+        else:
+            raise AssertionError(message)
+
+
+class LegacyError(Exception):
+    def __init__(self, message, code):
+        Exception.__init__(self, message)
+        self.code = code
+
+
+class Finished(StopIteration):
+    pass
+
+
+def test_builtin_exception_methods_are_reachable_from_classes():
+    error = LegacyError("failed", 3)
+    assert (error.args, str(error), error.code) == (("failed",), "failed", 3)
+    assert LegacyError.__init__ is not Exception.__init__
+    assert Finished(5).value == 5
+    assert not hasattr(ValueError(), "value")
+
+
+class Pair(tuple):
+    def __new__(cls, first, second):
+        return super().__new__(cls, (first, second))
+
+    @property
+    def first(self):
+        return self[0]
+
+
+class LabeledTuple(tuple):
+    def __repr__(self):
+        return "Labeled" + tuple.__repr__(self)
+
+
+class Doubled(int):
+    def __new__(cls, value):
+        return super().__new__(cls, value * 2)
+
+
+def test_tuple_subclasses_behave_as_tuples():
+    import json
+
+    pair = Pair(1, 2)
+    assert (pair.first, len(pair), pair[-1], pair[:1], repr(pair)) == (1, 2, 2, (1,), "(1, 2)")
+    assert isinstance(pair, tuple) and type(pair) is Pair
+    assert pair == (1, 2) and (1, 2) == pair and hash(pair) == hash((1, 2))
+    assert pair < (1, 3) and sorted([Pair(2, 1), Pair(1, 2)]) == [(1, 2), (2, 1)]
+    first, second = pair
+    assert (first, second, list(pair), 2 in pair) == (1, 2, [1, 2], True)
+    assert (pair + (3,), (0,) + pair, pair * 2) == ((1, 2, 3), (0, 1, 2), (1, 2, 1, 2))
+    assert type(pair + (3,)) is tuple and type(tuple(pair)) is tuple
+    assert (pair.count(1), pair.index(2), {pair: "v"}[(1, 2)]) == (1, 1, "v")
+    assert ("%s-%s" % pair, "{}-{}".format(*pair), json.dumps(pair)) == ("1-2", "1-2", "[1, 2]")
+    pair.extra = 5
+    assert pair.extra == 5
+    assert repr(LabeledTuple([1])) == "Labeled(1,)"
+    assert tuple.__new__(LabeledTuple, [4]) == (4,) and type(tuple.__new__(LabeledTuple)) is LabeledTuple
+    assert Pair.__mro__ == (Pair, tuple, object)
+
+
+class Record(dict):
+    """A dict whose keys read and write as attributes, like SciPy's result objects."""
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as error:
+            raise AttributeError(name) from error
+
+    __setattr__ = dict.__setitem__
+    __delattr__ = dict.__delitem__
+
+    def __dir__(self):
+        return list(self.keys())
+
+
+class Scaled(dict):
+    def __init__(self, factor):
+        super().__init__(factor=factor)
+        self.note = "kept"
+
+    def __missing__(self, key):
+        return key * self["factor"]
+
+
+def test_dict_subclasses_behave_as_dicts():
+    import json
+
+    record = Record(b=[2], a=1)
+    record.c = 3
+    assert (record.a, record["c"], len(record), "b" in record, list(record)) == (1, 3, 3, True, ["b", "a", "c"])
+    del record.c
+    assert "c" not in record and dir(record) == ["a", "b"]
+    try:
+        _ = record.missing
+    except AttributeError as error:
+        assert str(error) == "missing"
+    assert isinstance(record, dict) and type(record) is Record and repr(record) == "{'b': [2], 'a': 1}"
+    assert record == {"a": 1, "b": [2]} and {"a": 1, "b": [2]} == record
+    assert (dict(record), {**record}, (lambda **kw: kw)(**record)) == ({"b": [2], "a": 1},) * 3
+    assert (record.get("z", 9), sorted(record.items()), json.dumps(Record(k=1))) == (
+        9,
+        [("a", 1), ("b", [2])],
+        '{"k": 1}',
+    )
+    assert type(record.copy()) is dict and type(record | {}) is dict
+    alias = record
+    record |= {"d": 4}
+    assert record is alias and type(record) is Record and record.d == 4
+    try:
+        hash(record)
+    except TypeError as error:
+        assert str(error) == "unhashable type: 'Record'"
+    scaled = Scaled(3)
+    assert (scaled, scaled.note, scaled["ab"], dict.__getitem__(scaled, "factor")) == (
+        {"factor": 3},
+        "kept",
+        "ababab",
+        3,
+    )
+
+
+def test_builtin_new_constructs_subclass_instances():
+    assert (Doubled(3), type(Doubled(3)), Doubled(3) + 1) == (6, Doubled, 7)
+    try:
+        tuple.__new__(int, [4])
+    except TypeError as error:
+        assert str(error) == "tuple.__new__(int): int is not a subtype of tuple"
+    else:
+        raise AssertionError("tuple.__new__ accepted a class that is not a tuple subclass")
+    assert ((1, 2, 1).count(1), (1, 2).index(2)) == (2, 1)
+
+
+def test_functions_hold_their_own_attributes():
+    def counted():
+        counted.calls += 1
+        return counted.calls
+
+    counted.calls = 0
+    counted.__module__ = "elsewhere"
+    assert (counted(), counted(), counted.__module__) == (1, 2, "elsewhere")
+    del counted.calls
+    assert not hasattr(counted, "calls")
+    try:
+        del counted.calls
+    except AttributeError as error:
+        assert str(error) == "'function' object has no attribute 'calls'"
+    else:
+        raise AssertionError("deleting a missing function attribute succeeded")
+    counted.__name__ = "renamed"
+    assert counted.__name__ == "renamed"
+    try:
+        counted.__name__ = 3
+    except TypeError as error:
+        assert str(error) == "__name__ must be set to a string object"
+    else:
+        raise AssertionError("a function accepted a non-string __name__")
+    square = lambda value: value * value  # noqa: E731
+    square.label = "square"
+    assert (square.label, square(3)) == ("square", 9)

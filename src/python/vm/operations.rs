@@ -1,5 +1,6 @@
 //! VM adapters for unary, binary, comparison, construction, and formatting operations.
 
+use super::super::native::KindNumber;
 use super::format::{format_complex, format_float, format_integer, format_text, FormatError};
 use super::{
     number, protocol, BigInt, BinaryOperator, BuiltinType, ComparisonOperator, DisplayKind,
@@ -62,7 +63,8 @@ impl Vm<'_> {
         for unpacked in unpacked {
             let additions = if *unpacked {
                 let mapping = values.next().expect("dictionary stack contract");
-                match mapping
+                match self
+                    .builtin_view(mapping)?
                     .object_id()
                     .map(|id| self.state.heap.get(id))
                     .transpose()?
@@ -234,6 +236,10 @@ impl Vm<'_> {
             }
             return Ok(());
         }
+        // Instances of builtin subclasses compare as the values they hold; errors still name the
+        // subclasses.
+        let (subject_left, subject_right) = (left, right);
+        let (left, right) = (self.builtin_view(left)?, self.builtin_view(right)?);
         let result = match operator {
             ComparisonOperator::Equal => self.builtin_equality(&left, &right)?,
             ComparisonOperator::NotEqual => !self.builtin_equality(&left, &right)?,
@@ -251,7 +257,7 @@ impl Vm<'_> {
                     protocol::Comparison::Ordered(ordering) => accepted.contains(&ordering),
                     protocol::Comparison::Unordered => false,
                     protocol::Comparison::Unsupported => {
-                        return Err(self.raise_unorderable(symbol, &left, &right))
+                        return Err(self.raise_unorderable(symbol, &subject_left, &subject_right))
                     }
                 }
             }
@@ -430,6 +436,15 @@ impl Vm<'_> {
         let Some(id) = left.object_id() else {
             return Ok(None);
         };
+        // `dict |= other` is `dict.update(other)`, for a dict subclass too unless it defines its
+        // own `__ior__`.
+        if operator == BinaryOperator::BitwiseOr && self.updates_dict_in_place(id)? {
+            let update = self
+                .resolve_attribute(left, "update")?
+                .ok_or("dict.update is not available")?;
+            self.invoke_value(update, vec![right])?;
+            return Ok(Some(left));
+        }
         let replacement = match (self.state.heap.get(id)?, operator) {
             // `list += iterable` extends with any iterable, unlike `list + list`.
             (Object::List(items), BinaryOperator::Add) => {
@@ -438,14 +453,6 @@ impl Vm<'_> {
                     self.push_materialized(&mut items, value)?;
                 }
                 Object::List(items)
-            }
-            // `dict |= other` is `dict.update(other)`.
-            (Object::Dict(_) | Object::DefaultDict { .. }, BinaryOperator::BitwiseOr) => {
-                let update = self
-                    .resolve_attribute(left, "update")?
-                    .ok_or("dict.update is not available")?;
-                self.invoke_value(update, vec![right])?;
-                return Ok(Some(left));
             }
             (Object::List(_), BinaryOperator::Multiply)
             | (
@@ -472,6 +479,23 @@ impl Vm<'_> {
 
     /// Call the left operand's in-place method, looked up on its type as CPython does. A method
     /// that returns `NotImplemented` declines, and the caller falls back to the binary operator.
+    /// Whether `|=` on object `id` is `dict.update`: a dict, or a dict subclass instance whose
+    /// class does not define `__ior__`.
+    fn updates_dict_in_place(&mut self, id: super::super::heap::ObjectId) -> Result<bool, String> {
+        let class = match self.state.heap.get(id)? {
+            Object::Dict(_) | Object::DefaultDict { .. } => return Ok(true),
+            Object::Instance { class, .. } => *class,
+            _ => return Ok(false),
+        };
+        let holds_dict = match protocol::builtin_payload(&self.state.heap, &Value::Object(id))?
+            .and_then(|payload| payload.object_id())
+        {
+            Some(payload) => matches!(self.state.heap.get(payload)?, Object::Dict(_)),
+            None => false,
+        };
+        Ok(holds_dict && self.class_attribute(class, "__ior__")?.is_none())
+    }
+
     fn inplace_method(
         &mut self,
         operator: BinaryOperator,
@@ -778,8 +802,9 @@ impl Vm<'_> {
     }
 
     /// `format(value, spec)`, which CPython defines as `type(value).__format__(value, spec)`.
-    /// A user class's `__format__` runs as written. Other values accept only the empty spec,
-    /// which gives `str(value)`.
+    /// A user class's `__format__` runs as written. Registered numbers such as NumPy scalars
+    /// format as the Python number they stand for, as NumPy's `__format__` does. Other values
+    /// accept only the empty spec, which gives `str(value)`.
     pub(super) fn format_object(
         &mut self,
         value: &Value,
@@ -795,6 +820,20 @@ impl Vm<'_> {
                     });
                 }
             }
+        }
+        if let Some((_, number)) = super::number::registered_number(&self.state.heap, value) {
+            let number = match number {
+                KindNumber::Bool(value) => Value::Bool(value),
+                KindNumber::Int(value) => Value::Int(value),
+                KindNumber::UInt(value) => {
+                    self.allocate_object(Object::BigInt(BigInt::from(value)))?
+                }
+                KindNumber::Float(value) => Value::Float(value),
+                KindNumber::Complex(real, imag) => {
+                    self.allocate_object(Object::Complex { real, imag })?
+                }
+            };
+            return self.format_object(&number, format_spec);
         }
         if format_spec.is_empty() {
             return self.display_value(value);

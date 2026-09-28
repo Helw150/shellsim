@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use num_bigint::BigInt;
 use num_traits::{FromPrimitive, Zero};
 
-use super::heap::{Heap, InstancePayload, Object, ObjectId};
+use super::heap::{GlobalsTarget, Heap, InstancePayload, Object, ObjectId};
 pub use super::string::{string_ref, string_value};
 use super::Value;
 
@@ -20,24 +20,8 @@ pub fn display(heap: &Heap, value: &Value) -> Result<String, String> {
     if let Some((_, message)) = exception_parts(heap, value)? {
         return Ok(message);
     }
-    if let Some((_, args)) = user_exception_parts(heap, value)? {
-        return match args.as_slice() {
-            [] => Ok(String::new()),
-            [only] => {
-                if let Some(value) = string_value(heap, only)? {
-                    Ok(value)
-                } else {
-                    repr(heap, only)
-                }
-            }
-            _ => {
-                let values = args
-                    .iter()
-                    .map(|value| repr(heap, value))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(format!("({})", values.join(", ")))
-            }
-        };
+    if let Some(exception) = user_exception_parts(heap, value)? {
+        return exception_message(heap, exception.base, &exception.args);
     }
     repr(heap, value)
 }
@@ -63,6 +47,7 @@ pub fn int_value(heap: &Heap, value: &Value) -> Option<i64> {
     match super::number::index(heap, value)? {
         super::number::NumberRef::Int(value) => Some(value),
         super::number::NumberRef::BigInt(_)
+        | super::number::NumberRef::UInt(_)
         | super::number::NumberRef::Float(_)
         | super::number::NumberRef::Complex(..) => None,
     }
@@ -146,37 +131,89 @@ pub fn bytes_ref<'heap>(heap: &'heap Heap, value: &Value) -> Result<Option<&'hea
     })
 }
 
+/// The class name and `str()` of a builtin exception instance.
 pub fn exception_parts(heap: &Heap, value: &Value) -> Result<Option<(String, String)>, String> {
+    let Some((kind, args)) = exception_args(heap, value)? else {
+        return Ok(None);
+    };
+    let message = exception_message(heap, &kind, &args)?;
+    Ok(Some((kind, message)))
+}
+
+/// The class name and constructor arguments of a builtin exception instance.
+pub fn exception_args(heap: &Heap, value: &Value) -> Result<Option<(String, Vec<Value>)>, String> {
     let Some(id) = value.object_id() else {
         return Ok(None);
     };
     Ok(match heap.get(id)? {
-        Object::Exception { kind, message } => Some((kind.clone(), message.clone())),
+        Object::Exception { kind, args } => Some((kind.clone(), args.clone())),
         _ => None,
     })
 }
 
-fn user_exception_parts(
+/// `str()` of an exception of class `kind` (a builtin exception class name) with arguments
+/// `args`: empty without arguments, the `str()` of a single argument, whose `repr()` a
+/// `KeyError` shows because the argument is a key, and otherwise the `repr()` of the tuple.
+fn exception_message(heap: &Heap, kind: &str, args: &[Value]) -> Result<String, String> {
+    match args {
+        [] => Ok(String::new()),
+        [only] if super::exception_types::exception_is_subclass(kind, "KeyError") => {
+            repr(heap, only)
+        }
+        [only] => display(heap, only),
+        _ => {
+            let values = args
+                .iter()
+                .map(|value| repr(heap, value))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(format!("({})", values.join(", ")))
+        }
+    }
+}
+
+/// The builtin value behind an instance of a subclass of a builtin type such as `int` or
+/// `tuple`, which builtin operations the class does not override act on.
+pub fn builtin_payload(heap: &Heap, value: &Value) -> Result<Option<Value>, String> {
+    let Some(id) = value.object_id() else {
+        return Ok(None);
+    };
+    Ok(match heap.get(id)? {
+        Object::Instance {
+            payload: InstancePayload::Builtin(value),
+            ..
+        } => Some(*value),
+        _ => None,
+    })
+}
+
+/// The closest builtin exception ancestor and the `args` of an instance of a user exception
+/// class.
+pub fn user_exception_args(
     heap: &Heap,
     value: &Value,
-) -> Result<Option<(String, Vec<Value>)>, String> {
+) -> Result<Option<(&'static str, Vec<Value>)>, String> {
+    Ok(user_exception_parts(heap, value)?.map(|exception| (exception.base, exception.args)))
+}
+
+/// An instance of a user exception class: its closest builtin exception ancestor and `args`.
+struct UserException {
+    base: &'static str,
+    args: Vec<Value>,
+}
+
+fn user_exception_parts(heap: &Heap, value: &Value) -> Result<Option<UserException>, String> {
     let Some(id) = value.object_id() else {
         return Ok(None);
     };
     let Object::Instance { class, .. } = heap.get(id)? else {
         return Ok(None);
     };
-    let Object::Class {
-        name,
-        exception_base,
-        ..
-    } = heap.get(*class)?
-    else {
+    let Object::Class { exception_base, .. } = heap.get(*class)? else {
         return Ok(None);
     };
-    if exception_base.is_none() {
+    let Some(base) = *exception_base else {
         return Ok(None);
-    }
+    };
     let args = if let Some(symbol) = heap.symbol_id("args") {
         heap.attribute_by_symbol(id, symbol)?
             .and_then(|value| value.object_id())
@@ -188,7 +225,7 @@ fn user_exception_parts(
     } else {
         Vec::new()
     };
-    Ok(Some((name.clone(), args)))
+    Ok(Some(UserException { base, args }))
 }
 
 fn bigint_value<'a>(heap: &'a Heap, value: &Value) -> Option<&'a BigInt> {
@@ -218,13 +255,6 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
     if let Some(value) = value.native_value() {
         return Ok(value.repr());
     }
-    if let Some((kind, message)) = exception_parts(heap, value)? {
-        if message.is_empty() {
-            return Ok(kind);
-        } else {
-            return Ok(format!("{kind}: {message}"));
-        }
-    }
     if let Some(id) = value.object_id() {
         if !active.insert(id) {
             return Ok(match heap.get(id)? {
@@ -251,7 +281,9 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 Object::CallableIterator { .. } => "<callable_iterator ...>",
                 Object::Generator { .. } => "<generator ...>",
                 Object::Module { .. } => "<module ...>",
+                Object::Globals(_) => "<globals ...>",
                 Object::ArrayStorage(_) => "<array storage ...>",
+                Object::WideValue { .. } => "<value ...>",
                 Object::Array { .. } => "array(...)",
                 Object::Regex { .. } => "re.compile(...) ",
                 Object::Match { .. } => "<re.Match ...>",
@@ -273,12 +305,8 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
             Object::String(value) => quote_string(value),
             Object::Bytes(value) => quote_bytes(value),
             Object::ByteArray(value) => format!("bytearray({})", quote_bytes(value)),
-            Object::Exception { kind, message } => {
-                if message.is_empty() {
-                    kind.clone()
-                } else {
-                    format!("{kind}: {message}")
-                }
+            Object::Exception { kind, args } => {
+                format!("{kind}({})", render_values(heap, args, active)?.join(", "))
             }
             Object::List(values) => {
                 format!("[{}]", render_values(heap, values, active)?.join(", "))
@@ -292,11 +320,10 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 }
             }
             Object::Slice { start, stop, step } => {
-                let bound = |bound: &Option<i64>| match bound {
-                    Some(value) => value.to_string(),
-                    None => "None".to_string(),
-                };
-                format!("slice({}, {}, {})", bound(start), bound(stop), bound(step))
+                format!(
+                    "slice({})",
+                    render_values(heap, &[*start, *stop, *step], active)?.join(", ")
+                )
             }
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
                 let mut rendered = Vec::with_capacity(entries.len());
@@ -328,16 +355,24 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 }
             }
             Object::Function { name, .. } => format!("<function {name}>"),
-            Object::Class { name, .. } => format!("<class '{name}'>"),
+            Object::Class {
+                name, attributes, ..
+            } => match attributes.get("__module__") {
+                Some(module) => match string_value(heap, module)? {
+                    Some(module) if module != "builtins" => format!("<class '{module}.{name}'>"),
+                    _ => format!("<class '{name}'>"),
+                },
+                None => format!("<class '{name}'>"),
+            },
             Object::Instance { class, payload, .. } => match payload {
-                InstancePayload::Int(value) => value.to_string(),
+                InstancePayload::Builtin(value) => render(heap, value, active)?,
                 InstancePayload::Object => match heap.get(*class)? {
                     Object::Class {
                         name,
                         exception_base: Some(_),
                         ..
                     } => {
-                        let (_, args) = user_exception_parts(heap, value)?
+                        let UserException { args, .. } = user_exception_parts(heap, value)?
                             .ok_or("exception instance lost its native base")?;
                         format!("{name}({})", render_values(heap, &args, active)?.join(", "))
                     }
@@ -353,10 +388,27 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
             Object::CallableIterator { .. } => "<callable_iterator>".into(),
             Object::Generator { .. } => "<generator>".into(),
             Object::Module { name, .. } => format!("<module '{name}'>"),
-            Object::ArrayStorage(_) => "<array storage>".into(),
-            Object::Array { layout, dtype, .. } => {
-                format!("array(shape={:?}, dtype={})", layout.shape, dtype.name())
+            Object::Globals(GlobalsTarget::Scope(scope)) => {
+                let mut entries = heap.scope_values(*scope)?.into_iter().collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+                let mut rendered = Vec::with_capacity(entries.len());
+                for (name, value) in entries {
+                    rendered.push(format!(
+                        "{}: {}",
+                        quote_string(&name),
+                        render(heap, &value, active)?
+                    ));
+                }
+                format!("{{{}}}", rendered.join(", "))
             }
+            // The REPL/script table isn't reachable from a bare `&Heap`. `Vm::repr_nested`
+            // (via `repr_globals`) covers every ordinary `repr()`, `str()`, or `print()` call, so
+            // this generic fallback is only reached by the interactive REPL auto-printing a bare
+            // expression, which already skips a user `__repr__` for every other type too.
+            Object::Globals(GlobalsTarget::Repl) => "<globals>".to_string(),
+            Object::ArrayStorage(_) => "<array storage>".into(),
+            Object::WideValue { .. } => "<value>".into(),
+            Object::Array { view, .. } => format!("array(shape={:?})", view.shape),
             Object::Regex { pattern, .. } => format!("re.compile({})", quote_string(pattern)),
             Object::Match {
                 text, start, end, ..
@@ -444,9 +496,9 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
             (*step > 0 && *start < *stop) || (*step < 0 && *start > *stop)
         }
         Object::Instance {
-            payload: InstancePayload::Int(value),
+            payload: InstancePayload::Builtin(value),
             ..
-        } => *value != 0,
+        } => truth(heap, value)?,
         Object::Function { .. }
         | Object::Class { .. }
         | Object::Instance {
@@ -464,10 +516,12 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
         | Object::Module { .. }
         | Object::ArrayStorage(_)
         | Object::Array { .. }
+        | Object::WideValue { .. }
         | Object::Regex { .. }
         | Object::Match { .. }
         | Object::ArgumentParser { .. }
-        | Object::Namespace { .. } => true,
+        | Object::Namespace { .. }
+        | Object::Globals(_) => true,
         Object::EnumMember { .. } => true,
         Object::RaisesContext { .. } => true,
         Object::Property { .. }
@@ -514,16 +568,6 @@ fn equals_inner(
                 (Object::Bytes(left), Object::ByteArray(right))
                 | (Object::ByteArray(left), Object::Bytes(right))
                 | (Object::ByteArray(left), Object::ByteArray(right)) => left == right,
-                (
-                    Object::Exception {
-                        kind: lk,
-                        message: lm,
-                    },
-                    Object::Exception {
-                        kind: rk,
-                        message: rm,
-                    },
-                ) => lk == rk && lm == rm,
                 (Object::List(left), Object::List(right))
                 | (Object::Tuple(left), Object::Tuple(right)) => {
                     sequence_equal(heap, left, right, active)?
@@ -539,7 +583,12 @@ fn equals_inner(
                         stop: right_stop,
                         step: right_step,
                     },
-                ) => (left_start, left_stop, left_step) == (right_start, right_stop, right_step),
+                ) => sequence_equal(
+                    heap,
+                    &[*left_start, *left_stop, *left_step],
+                    &[*right_start, *right_stop, *right_step],
+                    active,
+                )?,
                 (
                     Object::Range {
                         start: left_start,
@@ -655,6 +704,16 @@ fn equals_inner(
 }
 
 fn scalar_equality(heap: &Heap, left: &Value, right: &Value) -> Result<Option<bool>, String> {
+    use super::number;
+    // Registered numbers such as NumPy scalars equal the Python number with the same value, so
+    // `np.int64(1)` finds the key `1` in a dict or list.
+    if number::registered_number(heap, left).is_some()
+        || number::registered_number(heap, right).is_some()
+    {
+        if let (Some(left), Some(right)) = (number::view(heap, left), number::view(heap, right)) {
+            return Ok(Some(number::numbers_equal(left, right)));
+        }
+    }
     if let Some(equal) = complex_equality(heap, left, right) {
         return Ok(Some(equal));
     }
@@ -743,6 +802,7 @@ fn complex_equality(heap: &Heap, left: &Value, right: &Value) -> Option<bool> {
         Some(NumberRef::Float(other)) => imag == 0.0 && real == other,
         Some(NumberRef::Int(other)) => exact_integer(BigInt::from(other)),
         Some(NumberRef::BigInt(other)) => exact_integer(other.clone()),
+        Some(NumberRef::UInt(other)) => exact_integer(BigInt::from(other)),
         None => false,
     })
 }
@@ -928,10 +988,12 @@ pub fn contains(heap: &Heap, container: &Value, needle: &Value) -> Result<bool, 
             | Object::Module { .. }
             | Object::ArrayStorage(_)
             | Object::Array { .. }
+            | Object::WideValue { .. }
             | Object::Regex { .. }
             | Object::Match { .. }
             | Object::ArgumentParser { .. }
-            | Object::Namespace { .. } => Err("object is not a container".into()),
+            | Object::Namespace { .. }
+            | Object::Globals(_) => Err("object is not a container".into()),
             Object::EnumMember { .. } => Err("object is not a container".into()),
             Object::RaisesContext { .. } => Err("object is not a container".into()),
             Object::Property { .. }

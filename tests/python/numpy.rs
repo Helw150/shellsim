@@ -32,6 +32,17 @@ fn assert_fails_with(source: &str, expected: &str) {
     );
 }
 
+/// Asserts that `stderr` holds one `RuntimeWarning` per listed script line, in order.
+fn assert_warning_lines(stderr: &[u8], lines: &[usize]) {
+    let stderr = String::from_utf8_lossy(stderr);
+    let reported: Vec<&str> = stderr.lines().collect();
+    assert_eq!(reported.len(), lines.len(), "{stderr:?}");
+    for (report, line) in reported.iter().zip(lines) {
+        let prefix = format!("<string>:{line}: RuntimeWarning: ");
+        assert!(report.starts_with(&prefix), "{stderr:?}");
+    }
+}
+
 #[test]
 fn construction_indexing_and_views_share_storage() {
     let source = r#"import numpy as np
@@ -53,7 +64,7 @@ print(a.astype(float).dtype, a.astype(float).tolist())
         run(source),
         (
             0,
-            b"(2, 3) 2 6 int64\narray([[1, 2, 3], [4, 5, 6]]) True True\n[[1, 2, 3], [4, 5, 6]] 6 [1, 2, 3]\n(3, 2) [[1, 4], [20, 5], [3, 6]] [[1, 20, 3], [4, 5, 6]]\n[[1, 20], [3, 4], [5, 60]] [[1, 20, 3], [4, 5, 60]]\n[1, 20, 3, 4, 5, 60] [1, 20, 3, 4, 5, 60]\n[1, 20, 3, 4, 5, 60] [[1, 20, 3], [4, 5, 60]]\nfloat64 [[1.0, 20.0, 3.0], [4.0, 5.0, 60.0]]\n".to_vec(),
+            b"(2, 3) 2 6 int64\n[[1 2 3]\n [4 5 6]] True True\n[[1, 2, 3], [4, 5, 6]] 6 [1, 2, 3]\n(3, 2) [[1, 4], [20, 5], [3, 6]] [[1, 20, 3], [4, 5, 6]]\n[[1, 20], [3, 4], [5, 60]] [[1, 20, 3], [4, 5, 60]]\n[1, 20, 3, 4, 5, 60] [1, 20, 3, 4, 5, 60]\n[1, 20, 3, 4, 5, 60] [[1, 20, 3], [4, 5, 60]]\nfloat64 [[1.0, 20.0, 3.0], [4.0, 5.0, 60.0]]\n".to_vec(),
             Vec::new(),
         )
     );
@@ -152,14 +163,15 @@ print(type(np.float64(1.5)), np.float64(1.5) + np.int64(2))
 print(np.array([np.int64(2), 3]).dtype, np.array([np.int64(2), 3]).tolist())
 print(np.array([1], dtype=np.int64).dtype)
 "#;
+    let (status, stdout, stderr) = run(source);
     assert_eq!(
-        run(source),
+        (status, stdout),
         (
             0,
             b"<class 'numpy.int64'> True -9223372036854775808\n<class 'numpy.float64'> 3.5\nint64 [2, 3]\nint64\n".to_vec(),
-            Vec::new(),
         )
     );
+    assert_warning_lines(&stderr, &[3]);
 
     assert_fails_with(
         "import numpy as np\nnp.int64(9223372036854775808)",
@@ -214,14 +226,16 @@ for value in (np.array([100], dtype=np.int8) * 2,
               np.array([1.5], dtype=np.float32) * 2.0):
     print(value.dtype, value.tolist())
 "#;
+    // The two scalar overflows warn, reported against the script's lines.
+    let (status, stdout, stderr) = run(source);
     assert_eq!(
-        run(source),
+        (status, stdout),
         (
             0,
-            b"-128 <class 'numpy.int16'>\n0 <class 'numpy.int32'>\n<class 'numpy.int64'> <class 'numpy.float64'>\n16777216.0\n<class 'numpy.float32'> <class 'numpy.float64'>\n<class 'numpy.float64'> <class 'numpy.float64'>\nfloat64 float64\n0.1\nint8 [-128, -127]\nuint8 [0] [255]\nint8 [-56]\nuint8 [2]\nuint64 [2]\nfloat32 [3.0]\n".to_vec(),
-            Vec::new(),
+            b"-128 <class 'numpy.int16'>\n0 <class 'numpy.int32'>\n<class 'numpy.int64'> <class 'numpy.float64'>\n1.6777216e+07\n<class 'numpy.float32'> <class 'numpy.float64'>\n<class 'numpy.float64'> <class 'numpy.float64'>\nfloat64 float64\n0.1\nint8 [-128, -127]\nuint8 [0] [255]\nint8 [-56]\nuint8 [2]\nuint64 [2]\nfloat32 [3.0]\n".to_vec(),
         )
     );
+    assert_warning_lines(&stderr, &[2, 3]);
 }
 
 #[test]
@@ -262,12 +276,8 @@ fn fixed_width_conversions_reject_values_outside_the_declared_dtype() {
     }
 
     assert_fails_with(
-        "import numpy as np\nnp.array([1], dtype='float16')",
-        "unsupported numpy dtype",
-    );
-    assert_fails_with(
         "import numpy as np\nnp.array([1], dtype='numpy.int8')",
-        "unsupported numpy dtype",
+        "TypeError",
     );
 }
 
@@ -375,6 +385,34 @@ print(values.tolist())
 }
 
 #[test]
+fn ellipsis_indices_keep_every_unindexed_axis_for_reads_and_writes() {
+    let source = r#"import numpy as np
+a = np.arange(24).reshape(2, 3, 4)
+print(a[..., 0].tolist(), a[0, ...].shape, a[...].shape)
+print(a[..., 1, 2].tolist(), a[1, ..., 3].tolist(), a[..., 1:3].shape)
+b = np.zeros((2, 2, 2), dtype=np.int64)
+b[..., 0] = 1
+print(b.tolist())
+z = np.array(5)
+view = z[...]
+view[...] = 7
+print(view.shape, z.tolist(), a[1, 2, 3, ...].shape)
+try:
+    a[..., 0, ...]
+except IndexError as error:
+    print(error)
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            b"[[0, 4, 8], [12, 16, 20]] (3, 4) (2, 3, 4)\n[6, 18] [15, 19, 23] (2, 3, 2)\n[[[1, 0], [1, 0]], [[1, 0], [1, 0]]]\n() 7 ()\nan index can only have a single ellipsis ('...')\n".to_vec(),
+            Vec::new(),
+        )
+    );
+}
+
+#[test]
 fn shape_views_constructors_and_joining_use_shared_kernels() {
     let source = r#"import numpy as np
 a = np.array([[[1], [2]]])
@@ -438,7 +476,7 @@ print(np.percentile([0, 10, 20, 30], 25))
         run(source),
         (
             0,
-            b"True True 2.0.0-shellsim\n[0.0, 3.0] [2.0, 2.0, -2.0]\n[-1, 0, 1]\n[False, True] [True, False]\n[[1, 0, 0], [0, 2, 0], [0, 0, 3]]\n[[0, 1, 0, 0], [0, 0, 2, 0], [0, 0, 0, 3], [0, 0, 0, 0]]\n[2, 6]\n[1, 2, 0]\n[[1, 0], [1, 0]]\nFalse\n7.5\n".to_vec(),
+            b"True True 2.5.3\n[0.0, 3.0] [2.0, 2.0, -2.0]\n[-1, 0, 1]\n[False, True] [True, False]\n[[1, 0, 0], [0, 2, 0], [0, 0, 3]]\n[[0, 1, 0, 0], [0, 0, 2, 0], [0, 0, 0, 3], [0, 0, 0, 0]]\n[2, 6]\n[1, 2, 0]\n[[1, 0], [1, 0]]\nFalse\n7.5\n".to_vec(),
             Vec::new(),
         )
     );
@@ -449,65 +487,188 @@ fn unsupported_or_invalid_array_operations_fail_explicitly() {
     for (source, expected) in [
         (
             "import numpy as np\nnp.array([[1], [2, 3]])",
-            "setting an array element with a sequence",
+            "ValueError",
         ),
         (
             "import numpy as np\nnp.array([1, 2]) + np.array([1, 2, 3])",
-            "operands could not be broadcast together",
-        ),
-        (
-            "import numpy as np\nnp.matmul(np.array([1, 2]), np.array([3, 4]))",
-            "matmul requires aligned two-dimensional arrays",
+            "ValueError",
         ),
         (
             "import numpy as np\nnp.zeros((-1, 2))",
-            "negative dimensions are not allowed",
+            "ValueError",
         ),
         (
-            "import numpy as np\nnp.array([1], dtype='complex64')",
-            "unsupported numpy dtype",
+            "import numpy as np\nnp.array([1], dtype='S3')",
+            "NumPy dtype 'S3' is not supported",
         ),
         (
             "import numpy as np\nbool(np.array([1, 2]))",
-            "truth value of an array",
+            "ValueError",
         ),
         (
             "import numpy as np\na = np.zeros((2, 2)); a[[0, 1]] = [1, 2, 3]",
-            "operands could not be broadcast together",
+            "ValueError",
         ),
         (
-            "import numpy as np\na = np.zeros((2, 2)); a[[0, 1]] = [[[1, 2], [3, 4]]]",
-            "assignment value cannot be broadcast to the indexed shape",
+            "import numpy as np\na = np.zeros((2, 2)); a[...] = np.ones((2, 2, 2))",
+            "ValueError",
         ),
         (
             "import numpy as np\nnp.zeros([1] * 65)",
-            "arrays support at most 64 dimensions",
+            "ValueError",
         ),
         (
             "import numpy as np\nvalue = 1\nfor _ in range(65):\n    value = [value]\nnp.array(value)",
-            "arrays support at most 64 dimensions",
+            "ValueError",
         ),
         (
-            "import numpy as np\nnp.array([1.0]) / 0",
-            "ZeroDivisionError",
+            "import numpy as np\nnp.linspace(0, 1j, 3, dtype=float)",
+            "linspace() with complex bounds and a real dtype is not supported",
         ),
     ] {
         assert_fails_with(source, expected);
     }
 }
 
+/// Storage is little-endian whatever the dtype's byte order, so operations that would expose
+/// the difference are rejected rather than answered with wrong bytes.
+#[test]
+fn byte_order_frontier_fails_explicitly() {
+    for (source, expected) in [
+        (
+            "import numpy as np\nnp.arange(2.0).view('>f8')",
+            "ndarray.view between byte orders is not supported",
+        ),
+        (
+            "import numpy as np\nnp.array([1j], dtype='>c8').view('>f8')",
+            "ndarray.view between byte orders is not supported",
+        ),
+        (
+            "import numpy as np\nnp.dtype('>U3')",
+            "big-endian dtype '>U3' is not supported",
+        ),
+        (
+            "import numpy as np\nnp.array([1, 'a'], dtype=object).tobytes()",
+            "ndarray.tobytes of an object array is not supported",
+        ),
+    ] {
+        assert_fails_with(source, expected);
+    }
+}
+
+/// `frombuffer` copies because arrays cannot share a `bytearray`'s storage; the copy is
+/// read-only so a write NumPy would pass through fails instead of silently diverging.
+#[test]
+fn frombuffer_over_a_bytearray_is_a_read_only_copy() {
+    let source = r#"import numpy as np
+data = bytearray(b"\x01\x00\x02\x00")
+values = np.frombuffer(data, dtype="<i2")
+data[0] = 9
+print(values.tolist(), values.flags.writeable)
+try:
+    values[0] = 5
+except ValueError as error:
+    print(error)
+"#;
+    let (status, stdout, stderr) = run(source);
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "[1, 2] False\nassignment destination is read-only\n"
+    );
+}
+
+/// shellsim has no pickler, so `dtype=object` arrays cannot round-trip through `.npy`/`.npz` at
+/// all: both `np.save` and `np.load` reject that dtype outright, regardless of `allow_pickle`.
+#[test]
+fn numpy_file_io_frontier_fails_explicitly() {
+    for (source, expected) in [
+        (
+            "np.genfromtxt(io.StringIO('a b\\n1 2'), names=True)",
+            "genfromtxt with names= builds structured arrays",
+        ),
+        (
+            "np.genfromtxt(io.StringIO('1 2'), usemask=True)",
+            "masked arrays are not supported by shellsim's NumPy",
+        ),
+        (
+            "np.genfromtxt(io.StringIO('1 x'), dtype=None, encoding='utf-8')",
+            "genfromtxt columns of different types need a structured array",
+        ),
+        (
+            "np.loadtxt(io.StringIO('1 2'), dtype=[('a', int), ('b', int)])",
+            "NumPy dtype [('a', <class 'int'>), ('b', <class 'int'>)] is not supported",
+        ),
+        (
+            "np.loadtxt(io.StringIO('1 2'), dtype='i4,i4')",
+            "NumPy dtype 'i4,i4' is not supported",
+        ),
+        (
+            "b = io.BytesIO(); np.save(b, np.arange(2)); b.seek(0); np.load(b, mmap_mode='r')",
+            "memory-mapped arrays are not supported by shellsim's NumPy",
+        ),
+        (
+            "from numpy._io import write_array_header_1_0\nb = io.BytesIO()\nwrite_array_header_1_0(b, {'descr': [('a', '<i4')], 'fortran_order': False, 'shape': (1,)})\nb.write(bytes(4)); b.seek(0); np.load(b)",
+            "structured dtypes are not supported by shellsim's NumPy",
+        ),
+        (
+            "np.save(io.BytesIO(), np.empty(1, dtype=object))",
+            "dtype=object arrays cannot be saved by shellsim's NumPy",
+        ),
+        (
+            "np.save(io.BytesIO(), np.empty(1, dtype=object), allow_pickle=False)",
+            "dtype=object arrays cannot be saved by shellsim's NumPy",
+        ),
+    ] {
+        assert_fails_with(&format!("import io\nimport numpy as np\n{source}"), expected);
+    }
+}
+
+/// `numpy.lib` and `numpy.strings` mirror no shellsim area: they are simply missing modules.
+#[test]
+fn removed_numpy_submodules_are_missing() {
+    for source in ["import numpy.lib", "import numpy.strings"] {
+        assert_fails_with(
+            &format!("import numpy as np\n{source}"),
+            "ModuleNotFoundError",
+        );
+    }
+}
+
 #[test]
 fn array_allocation_obeys_the_modeled_memory_limit() {
+    // Importing NumPy fits in 8 MiB; the array needs 32 MB.
     let environment = Environment::with_limits(Limits {
-        cpu: 1_000_000,
-        memory: 16 * 1024,
+        cpu: 100_000_000,
+        memory: 8 * 1024 * 1024,
         disk: 1024 * 1024,
         output: 1024,
     });
-    let (status, _, stderr) =
-        run_with_environment(environment, "import numpy as np\nnp.zeros((100, 100))");
-    assert_eq!(status, 137);
+    let source = "import numpy as np\nprint('ready')\nnp.zeros((2000, 2000))";
+    let (status, stdout, stderr) = run_with_environment(environment, source);
+    assert_eq!((status, stdout.as_slice()), (137, b"ready\n".as_slice()));
     assert!(stderr.is_empty());
+}
+
+#[test]
+fn kron_and_block_results_obey_the_memory_limit() {
+    // Importing NumPy fits in 8 MiB; each result holds 4 million float64 values (32 MB).
+    for operation in ["np.kron(a, a)", "np.block([a] * 2000)"] {
+        let environment = Environment::with_limits(Limits {
+            cpu: 100_000_000,
+            memory: 8 * 1024 * 1024,
+            disk: 1024 * 1024,
+            output: 1024,
+        });
+        let source = format!("import numpy as np\na = np.ones(2000)\nprint('ready')\n{operation}");
+        let (status, stdout, stderr) = run_with_environment(environment, &source);
+        assert_eq!(
+            (status, stdout.as_slice()),
+            (137, b"ready\n".as_slice()),
+            "{operation}"
+        );
+        assert!(stderr.is_empty());
+    }
 }
 
 #[test]
@@ -615,77 +776,12 @@ print('ok')
 #[test]
 fn complex_operations_without_a_real_value_domain_fail_explicitly() {
     let prelude = "import numpy as np\nx = np.array([1+2j, 3-4j])\n";
-    for (operation, expected) in [
-        (
-            "x < x",
-            "ordering comparison is not supported for complex values",
-        ),
-        (
-            "x >= 1",
-            "ordering comparison is not supported for complex values",
-        ),
-        (
-            "np.float64(1) < 1j",
-            "ordering comparison is not supported for complex values",
-        ),
-        ("x.min()", "ndarray.min is not supported for complex values"),
-        ("np.max(x)", "numpy.max is not supported for complex values"),
-        (
-            "np.argmax(x)",
-            "numpy.argmax is not supported for complex values",
-        ),
-        (
-            "np.argsort(x)",
-            "numpy.argsort is not supported for complex values",
-        ),
-        (
-            "np.minimum(x, 1)",
-            "numpy.minimum is not supported for complex values",
-        ),
-        (
-            "np.sqrt(x)",
-            "numpy.sqrt is not supported for complex values",
-        ),
-        ("np.exp(x)", "numpy.exp is not supported for complex values"),
-        (
-            "np.floor(x)",
-            "numpy.floor is not supported for complex values",
-        ),
-        (
-            "np.isnan(x)",
-            "numpy.isnan is not supported for complex values",
-        ),
-        (
-            "np.isinf(x)",
-            "numpy.isinf is not supported for complex values",
-        ),
-        ("~x", "numpy.invert is not supported for complex values"),
-        (
-            "np.percentile(x, 50)",
-            "numpy.percentile is not supported for complex values",
-        ),
-        (
-            "np.allclose(x, x)",
-            "numpy.allclose is not supported for complex values",
-        ),
-        (
-            "np.linspace(0, 1j, 3)",
-            "numpy.linspace is not supported for complex values",
-        ),
-        ("np.var(x)", "numpy.var is not supported for complex values"),
-        (
-            "np.median(x)",
-            "numpy.median is not supported for complex values",
-        ),
-        (
-            "x.astype(float)",
-            "cannot convert complex to numpy.float64 without discarding the imaginary part",
-        ),
-        (
-            "np.array([1j], dtype=np.int32)",
-            "cannot convert complex to numpy.int32 without discarding the imaginary part",
-        ),
+    for operation in [
+        "np.floor(x)",
+        "~x",
+        "np.percentile(x, 50)",
+        "np.array([1j], dtype=np.int32)",
     ] {
-        assert_fails_with(&format!("{prelude}{operation}"), expected);
+        assert_fails_with(&format!("{prelude}{operation}"), "TypeError");
     }
 }

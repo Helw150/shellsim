@@ -311,6 +311,364 @@ def test_generators_suspend_with_persistent_lexical_state():
     assert thrown_cleanup == ["closed"]
 
 
+def test_generator_throw_raises_at_the_suspended_yield():
+    def recovering():
+        try:
+            yield "first"
+        except ValueError as error:
+            yield f"handled {error}"
+        yield "last"
+
+    generator = recovering()
+    assert next(generator) == "first"
+    assert generator.throw(ValueError("bad")) == "handled bad"
+    assert next(generator) == "last"
+
+    def finishing():
+        try:
+            yield
+        except KeyError:
+            return
+
+    finished = finishing()
+    next(finished)
+    try:
+        finished.throw(KeyError)
+    except StopIteration:
+        pass
+    else:
+        raise AssertionError("a generator that returns after throw() must raise StopIteration")
+
+    exits = []
+
+    class Recorder:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, kind, value, traceback):
+            exits.append(kind.__name__)
+            return kind is ValueError
+
+    def managed():
+        with Recorder():
+            yield "inside"
+        yield "after"
+
+    inside = managed()
+    assert next(inside) == "inside"
+    assert inside.throw(ValueError("swallowed")) == "after"
+    assert exits == ["ValueError"]
+
+    def unstarted():
+        yield "never"
+
+    fresh = unstarted()
+    try:
+        fresh.throw(ValueError("early"))
+    except ValueError as error:
+        assert str(error) == "early"
+    assert next(fresh, "done") == "done"
+
+
+def test_generator_close_raises_generator_exit_without_resuming():
+    events = []
+
+    def steps():
+        try:
+            yield 1
+            events.append("resumed")
+            yield 2
+        finally:
+            events.append("cleanup")
+
+    generator = steps()
+    assert next(generator) == 1
+    assert generator.close() is None
+    assert events == ["cleanup"]
+    assert next(generator, "done") == "done"
+
+    def stubborn():
+        try:
+            yield 1
+        except GeneratorExit:
+            yield 2
+
+    ignoring = stubborn()
+    next(ignoring)
+    try:
+        ignoring.close()
+    except RuntimeError as error:
+        assert str(error) == "generator ignored GeneratorExit"
+    else:
+        raise AssertionError("close() must reject a generator that yields again")
+
+
+def test_yield_from_delegates_to_the_subgenerator():
+    events = []
+
+    def inner():
+        try:
+            received = yield 1
+            events.append(("inner received", received))
+            received = yield 2
+            events.append(("inner received", received))
+        except ValueError as error:
+            events.append(("inner caught", str(error)))
+            yield "recovered"
+        finally:
+            events.append("inner cleanup")
+        return "inner result"
+
+    def outer():
+        result = yield from inner()
+        events.append(("outer result", result))
+        yield "after"
+
+    generator = outer()
+    assert [next(generator), generator.send("a"), generator.send("b")] == [1, 2, "after"]
+    assert events == [
+        ("inner received", "a"),
+        ("inner received", "b"),
+        "inner cleanup",
+        ("outer result", "inner result"),
+    ]
+
+    events.clear()
+    generator = outer()
+    next(generator)
+    assert generator.throw(ValueError("boom")) == "recovered"
+    assert next(generator) == "after"
+    assert events == [("inner caught", "boom"), "inner cleanup", ("outer result", "inner result")]
+
+    events.clear()
+    generator = outer()
+    next(generator)
+    generator.close()
+    assert events == ["inner cleanup"]
+
+    def nested():
+        return (yield from outer())
+
+    generator = nested()
+    assert [next(generator), generator.send("x"), generator.send("y")] == [1, 2, "after"]
+
+    def returns_when_thrown():
+        try:
+            yield 1
+        except ValueError:
+            return "handled"
+
+    def delegator():
+        value = yield from returns_when_thrown()
+        yield value
+
+    generator = delegator()
+    next(generator)
+    assert generator.throw(ValueError) == "handled"
+
+
+def test_yield_from_raises_unhandled_exceptions_in_the_delegating_generator():
+    def inner():
+        yield 1
+
+    def delegator():
+        try:
+            yield from inner()
+        except KeyError as error:
+            yield ("caught", error.args)
+
+    generator = delegator()
+    next(generator)
+    assert generator.throw(KeyError("k")) == ("caught", ("k",))
+
+    def stubborn():
+        try:
+            yield 1
+        except GeneratorExit:
+            yield 2
+
+    def wraps_stubborn():
+        yield from stubborn()
+
+    generator = wraps_stubborn()
+    next(generator)
+    try:
+        generator.close()
+    except RuntimeError as error:
+        assert str(error) == "generator ignored GeneratorExit"
+    else:
+        raise AssertionError("close() must reject a subgenerator that yields again")
+
+
+def test_yield_from_a_plain_iterable_evaluates_to_none():
+    def plain():
+        value = yield from [1, 2, 3]
+        return value
+
+    assert list(plain()) == [1, 2, 3]
+    generator = plain()
+    next(generator)
+    try:
+        generator.send(5)
+    except AttributeError as error:
+        assert "object has no attribute 'send'" in str(error)
+    else:
+        raise AssertionError("a list iterator has no send()")
+
+    def empty():
+        yield from ()
+        return 3
+
+    try:
+        next(empty())
+    except StopIteration as stop:
+        assert stop.value == 3
+    else:
+        raise AssertionError("an empty delegation must finish the generator")
+
+    def finished():
+        yield 1
+        return 7
+
+    exhausted = finished()
+    assert list(exhausted) == [1]
+
+    def reuse():
+        value = yield from exhausted
+        yield value
+
+    # A finished generator delivers its return value only once, to whoever finished it.
+    assert list(reuse()) == [None]
+
+
+class Counter:
+    """An infinite iterator that records each `__next__` call."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.calls += 1
+        return self.calls
+
+
+class Countdown:
+    def __init__(self, start):
+        self.remaining = start
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.remaining == 0:
+            raise StopIteration
+        self.remaining -= 1
+        return self.remaining
+
+
+class Naturals:
+    def __iter__(self):
+        number = 0
+        while True:
+            number += 1
+            yield number
+
+
+def test_class_iterators_advance_one_item_at_a_time():
+    counter = Counter()
+    for value in counter:
+        if value == 3:
+            break
+    assert counter.calls == 3
+    assert iter(counter) is counter
+    assert next(counter) == 4
+
+    for value in Naturals():
+        if value == 3:
+            break
+    assert value == 3
+    naturals = iter(Naturals())
+    assert [next(naturals), next(naturals)] == [1, 2]
+
+    import itertools
+
+    assert list(itertools.islice(Naturals(), 3)) == [1, 2, 3]
+
+    def delegate():
+        yield from Counter()
+
+    generator = delegate()
+    assert [next(generator), next(generator)] == [1, 2]
+
+    assert list(Countdown(3)) == [2, 1, 0]
+    assert sorted(Countdown(3)) == [0, 1, 2]
+    assert sum(Countdown(4)) == 6
+    assert [value * 2 for value in Countdown(2)] == [2, 0]
+    first, second = Countdown(2)
+    assert (first, second) == (1, 0)
+
+
+def test_iter_rejects_classes_without_a_proper_iterator():
+    class ReturnsList:
+        def __iter__(self):
+            return [1, 2]
+
+    class NotIterable:
+        __iter__ = None
+
+    for operation, message in [
+        (lambda: iter(ReturnsList()), "iter() returned non-iterator of type 'list'"),
+        (lambda: list(ReturnsList()), "iter() returned non-iterator of type 'list'"),
+        (lambda: iter(NotIterable()), "'NotIterable' object is not iterable"),
+    ]:
+        try:
+            operation()
+        except TypeError as error:
+            assert str(error) == message
+        else:
+            raise AssertionError(f"no TypeError: {message}")
+
+
+def test_yield_from_a_class_iterator_uses_its_send_throw_and_close():
+    events = []
+
+    class Echo:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return "next"
+
+        def send(self, value):
+            if value == "stop":
+                raise StopIteration("echo done")
+            return ("echo", value)
+
+        def throw(self, error):
+            return ("threw", type(error).__name__)
+
+        def close(self):
+            events.append("closed")
+
+    def delegate():
+        result = yield from Echo()
+        yield ("result", result)
+
+    generator = delegate()
+    assert next(generator) == "next"
+    assert generator.send(1) == ("echo", 1)
+    assert generator.throw(ValueError("x")) == ("threw", "ValueError")
+    assert generator.send("stop") == ("result", "echo done")
+
+    generator = delegate()
+    next(generator)
+    generator.close()
+    assert events == ["closed"]
+
+
 def test_numeric_literals_and_arithmetic_match_python():
     values = [1.2, 0.5, 1.0, 1_000.50_0, 1_2e-1, 1_2e1]
     assert values == [1.2, 0.5, 1.0, 1000.5, 1.2, 120.0]
@@ -859,6 +1217,60 @@ def test_with_enter_failure_reaches_the_enclosing_context_only():
         assert str(error) == ("'int' object does not support the context manager protocol (missed __exit__ method)")
 
 
+def test_with_several_items_nests_them_in_order():
+    events = []
+
+    class Context:
+        def __init__(self, name):
+            self.name = name
+
+        def __enter__(self):
+            events.append("enter " + self.name)
+            return self.name
+
+        def __exit__(self, kind, value, traceback):
+            events.append("exit " + self.name)
+
+    with Context("a") as a, Context("b") as b:
+        events.append(a + b)
+    with (
+        Context("c") as c,
+        Context("d") as d,
+    ):
+        events.append(c + d)
+    with Context("e"):
+        pass
+    with Context("f") as f:
+        events.append(f)
+    try:
+        with Context("g"), Context("h"):
+            raise ValueError("boom")
+    except ValueError:
+        events.append("caught")
+    assert events == [
+        "enter a",
+        "enter b",
+        "ab",
+        "exit b",
+        "exit a",
+        "enter c",
+        "enter d",
+        "cd",
+        "exit d",
+        "exit c",
+        "enter e",
+        "exit e",
+        "enter f",
+        "f",
+        "exit f",
+        "enter g",
+        "enter h",
+        "exit h",
+        "exit g",
+        "caught",
+    ]
+
+
 def test_with_suppressing_an_exception_inside_loops_keeps_the_loop_running():
     class Suppress:
         def __enter__(self):
@@ -1003,3 +1415,107 @@ def test_slice_builtin_builds_slices():
         assert str(error) == "slice expected at least 1 argument, got 0"
     else:
         raise AssertionError("slice() accepted no arguments")
+
+
+_globals_test_marker = "module-level"
+
+
+def test_globals_reads_writes_and_deletes_module_names():
+    assert globals()["_globals_test_marker"] == "module-level"
+
+    globals()["_globals_written_name"] = 41
+    assert _globals_written_name == 41  # noqa: F821
+    globals()["_globals_written_name"] = 42
+    assert _globals_written_name == 42  # noqa: F821
+
+    del globals()["_globals_written_name"]
+    assert "_globals_written_name" not in globals()
+    try:
+        _ = _globals_written_name  # noqa: F821
+    except NameError:
+        pass
+    else:
+        raise AssertionError("deleting through globals() left the name bound")
+
+
+def test_globals_missing_key_raises_key_error():
+    try:
+        globals()["_globals_definitely_missing"]
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("reading a missing key did not raise KeyError")
+    try:
+        del globals()["_globals_definitely_missing"]
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("deleting a missing key did not raise KeyError")
+
+
+def test_globals_iteration_contains_known_names():
+    names = list(globals())
+    assert "_globals_test_marker" in names
+    assert all(isinstance(name, str) for name in names)
+    assert len(names) == len(globals())
+    assert set(iter(globals())) == set(globals().keys())
+
+
+def test_globals_get_setdefault_update_and_pop():
+    view = globals()
+    assert view.get("_globals_missing_get", "fallback") == "fallback"
+    assert view.get("_globals_test_marker") == "module-level"
+
+    assert view.setdefault("_globals_default_name", 7) == 7
+    assert _globals_default_name == 7  # noqa: F821
+    assert view.setdefault("_globals_default_name", 99) == 7
+
+    view.update({"_globals_update_name": 1}, _globals_update_kw=2)
+    assert _globals_update_name == 1  # noqa: F821
+    assert _globals_update_kw == 2  # noqa: F821
+
+    assert view.pop("_globals_update_name") == 1
+    assert "_globals_update_name" not in view
+    assert view.pop("_globals_missing_pop", "default") == "default"
+    try:
+        view.pop("_globals_missing_pop")
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("pop of a missing key did not raise")
+
+
+def test_globals_in_a_function_ignores_the_callers_locals():
+    def callee():
+        return "caller_only_local" in globals()
+
+    def caller():
+        caller_only_local = "value"  # noqa: F841
+        return callee()
+
+    assert caller() is False
+
+
+def test_globals_in_a_class_body_is_the_enclosing_modules_namespace():
+    enclosing_only_local = "value"  # noqa: F841
+
+    class Marker:
+        sees_module_globals = "_globals_test_marker" in globals()
+        sees_enclosing_local = "enclosing_only_local" in globals()
+
+    assert Marker.sees_module_globals is True
+    assert Marker.sees_enclosing_local is False
+
+
+def test_sorted_over_globals_and_type_name_are_sensible():
+    names = sorted(globals())
+    assert names == sorted(globals().keys())
+    assert all(isinstance(name, str) for name in names)
+    assert "_globals_test_marker" in names
+
+    view = globals()
+    assert isinstance(type(view).__name__, str) and type(view).__name__
+    assert isinstance(repr(view), str)
+    snapshot = view.copy()
+    assert isinstance(snapshot, dict)
+    assert snapshot["_globals_test_marker"] == "module-level"

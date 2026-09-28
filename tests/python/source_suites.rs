@@ -10,7 +10,11 @@ use std::time::Instant;
 use shellsim::{Environment, Limits};
 
 const BUILTINS: &[u8] = include_bytes!("test_builtins.py");
+const COLLECTIONS: &[u8] = include_bytes!("test_collections.py");
 const ASYNCIO: &[u8] = include_bytes!("test_asyncio.py");
+const CONTEXTLIB: &[u8] = include_bytes!("test_contextlib.py");
+const IMPORTLIB: &[u8] = include_bytes!("test_importlib.py");
+const INSPECT: &[u8] = include_bytes!("test_inspect.py");
 const LANGUAGE: &[u8] = include_bytes!("test_language.py");
 const EXCEPTIONS: &[u8] = include_bytes!("test_exceptions.py");
 const FRACTIONS: &[u8] = include_bytes!("test_fractions.py");
@@ -68,6 +72,26 @@ fn builtins() {
 #[test]
 fn asyncio() {
     assert_source_suite("test_asyncio.py", ASYNCIO);
+}
+
+#[test]
+fn collections() {
+    assert_source_suite("test_collections.py", COLLECTIONS);
+}
+
+#[test]
+fn contextlib() {
+    assert_source_suite("test_contextlib.py", CONTEXTLIB);
+}
+
+#[test]
+fn importlib() {
+    assert_source_suite("test_importlib.py", IMPORTLIB);
+}
+
+#[test]
+fn inspect() {
+    assert_source_suite("test_inspect.py", INSPECT);
 }
 
 #[test]

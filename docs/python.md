@@ -32,15 +32,23 @@ The runtime supports functions and closures, classes and descriptors, exceptions
 managers, comprehensions and lazy generators, arbitrary-precision integers, mutable containers,
 f-strings, VFS imports, and the common language protocols needed by real scripts. Generators
 support `yield`, `yield from`, `send`, `throw`, and `close`, including suspension in `try` and
-`with` regions. Generator shutdown uses a deliberately simple bounded drain through pending
-cleanup code.
+`with` regions. `throw` raises the exception at the suspended `yield`, so the generator's
+`except`, `finally`, and `with` blocks handle it, and `close` raises `GeneratorExit` there. `yield
+from` passes `send`, `throw`, and `close` through to the subiterator's methods of those names and
+evaluates to the value the subiterator returns. A builtin iterator has none of them: sending it a
+value other than `None` raises `AttributeError`, an exception thrown at it is raised in the
+delegating generator, and the expression evaluates to `None`.
+
+`for` loops, `yield from`, `iter`, `next`, and `itertools.islice` advance an iterator returned by
+a class's `__iter__` one `__next__` call at a time, so infinite iterators and side effects in
+`__next__` behave as in CPython. `map`, `filter`, `zip`, `enumerate`, and `itertools.chain`
+still consume their whole input before returning.
 
 `complex` is a native arena type. Its arithmetic, string parsing, `repr`, and error messages
 follow CPython 3.14, including the mixed-mode rules for real operands. Ordering, floor division,
 modulo, `int()`, `float()`, `round()`, and `math` functions reject complex values with
 `TypeError`. Complex format specifications follow CPython: the width applies to the whole
-number, and zero padding, `=` alignment and `%` are rejected. NumPy `complex128` arrays store
-these values directly, and `numpy.complex128` is the builtin `complex` type.
+number, and zero padding, `=` alignment and `%` are rejected.
 
 The core collection surface includes mutable sets and immutable `frozenset` values with mixed
 comparison and set algebra. VFS-backed text and binary files support read, write, append, and
@@ -59,8 +67,38 @@ testing `NotImplemented` for truth raises `TypeError`. Lists, tuples, dictionari
 elements, find keys, and answer `in` with `x is y or x == y`, so a class's `__eq__` holds inside
 containers and an equal key of another type, such as `0.5` for `Fraction(1, 2)`, finds a dict entry.
 `object` provides `__hash__`, `__eq__`, and `__ne__`, so a class that defines `__eq__` can keep
-identity hashing with `__hash__ = object.__hash__`. Builtin functions, native methods and bound
-methods report `__name__`, and bound methods expose `__self__` and `__func__`.
+identity hashing with `__hash__ = object.__hash__`.
+
+Classes record their defining module as `__module__` and report `__bases__`, `__mro__`, and
+`mro()`, including native bases such as `int` and the exception hierarchy; `repr` qualifies the
+class name with its module. Class attributes, special methods included, may be assigned or deleted
+after the class statement, and the change applies to existing instances and subclasses. `del
+obj.attr` and `delattr` delete through the descriptor protocol: a class's `__delattr__`, a
+descriptor's `__delete__`, then the instance's own attribute. Classes and functions have no
+`__qualname__` or `__doc__`, so a nested class's `repr` omits its enclosing scope. Builtin
+functions, native methods and bound methods report `__name__`, and bound methods expose
+`__self__` and `__func__`. A function holds its own attributes, as decorators expect: they may be
+assigned and deleted, and assigning `__name__` renames the function.
+
+A class may subclass `int`, `tuple` or `dict`. Its instances carry the builtin value, so
+arithmetic, comparison, hashing, indexing, iteration, `len`, `repr` and `json.dumps` act on that
+value unless the class overrides them. The subclass inherits the native methods such as
+`bit_length`, `to_bytes`, `count`, `index`, `get` and `update`, and `from_bytes` called on the
+subclass returns an instance of it. `int.__new__(cls, ...)` and `tuple.__new__(cls, ...)` build a
+subclass instance from a user `__new__`. A `dict` subclass with its own `__init__` starts empty
+and fills itself through `super().__init__(...)`; its `__missing__` supplies absent keys, and
+`dict.__getitem__`, `dict.__setitem__` and the other mapping methods can be called or assigned
+explicitly, as in `__setattr__ = dict.__setitem__`. Subclassing any other builtin type, such as
+`list` or `str`, fails with exit status 2 rather than producing an instance that lacks the
+builtin behavior.
+
+Calling a class whose MRO defines `__new__` calls it with the class and the arguments, then
+calls `__init__` only if the result is an instance of the class. `object.__new__` creates a plain
+instance and, like CPython's, rejects arguments that neither an overriding `__new__` nor an
+`__init__` would accept. Attribute lookup on a class continues through its builtin ancestors, so
+`C.__init__ is object.__init__` for a class without its own, and `Exception.__init__(self, message)`
+initializes a user exception. User `__new__` methods of exception classes and dataclasses are not
+called yet.
 
 Augmented assignment updates mutable operands in place, as in CPython: `list +=` extends with any
 iterable, `set |=` and its siblings mutate the set, `dict |=` updates the mapping, and user classes
@@ -74,10 +112,14 @@ grouping. `from module import *` binds the names in a list or tuple `__all__`, o
 names without a leading underscore, and only at module level. The `__import__` builtin uses the
 simulated loader for absolute imports; relative
 `__import__` calls are explicitly unsupported. The `exec`
-builtin accepts one source string and executes it in the simulated namespace. Code objects and
-explicit globals or locals mappings are not supported.
+builtin accepts one source string and executes it in the module namespace. The `eval` builtin
+accepts one expression string and returns its value, reading the calling function's locals as
+CPython does. Code objects and explicit globals or locals mappings are not supported by either.
 The frozen `functools` module provides `reduce` and positional and keyword argument binding with
-`partial`. The frozen `operator` module provides CPython's operator functions, `itemgetter`,
+`partial`. The frozen `contextlib` module provides `contextmanager`, `suppress`, `nullcontext`,
+`closing`, and `ExitStack`. The frozen `inspect` module provides `signature`, `Signature`, and
+`Parameter` for Python functions, bound methods, classes with a Python `__init__`, and instances
+with a Python `__call__`; builtin callables have no signature and raise `ValueError`. The frozen `operator` module provides CPython's operator functions, `itemgetter`,
 `attrgetter`, and `methodcaller`.
 
 `math` includes `isclose`, the hyperbolic functions and their inverses, and `gamma` and
@@ -86,6 +128,21 @@ crate, so their last bit can differ from CPython's. Poles and out-of-domain argu
 `ValueError`, and finite arguments whose result overflows raise `OverflowError`. `round()` and
 `math.floor`, `ceil`, and `trunc` defer to a class's `__round__`, `__floor__`, `__ceil__`, and
 `__trunc__`, and other `math` functions convert instances through `__float__`.
+
+The frozen `collections` module provides `namedtuple`, with `rename=`, `defaults=` and `module=`,
+CPython's argument and validation errors, and `_make`, `_replace`, `_asdict`, `_fields`,
+`_field_defaults` and `__match_args__`. `typing.NamedTuple` builds the same classes, called with
+`(name, type)` pairs or used as the base of a class whose annotated names become the fields and
+whose other attributes are copied onto the class; its deprecated keyword and field-less forms are
+not supported. A class records its caller's module through `sys._getframemodulename`. Two
+differences remain: `__slots__` is not enforced, so instances accept new attributes, and a field
+reads through `__getitem__`, so a subclass that overrides it changes what its fields return.
+`keyword` lists the hard and soft keywords, and `str.isidentifier` uses Unicode's identifier
+classes.
+
+Unpacking into a fixed number of targets reads at most one item more than it needs, so unpacking
+an infinite iterator fails with `ValueError` instead of running forever. As in CPython, only an
+exact list, tuple or dict reports how many items it held when there are too many.
 
 The frozen `fractions` module provides `Fraction`, built from integers, fractions, rational or
 decimal strings, and floats or other objects with `as_integer_ratio`. Arithmetic with integers and
@@ -99,8 +156,12 @@ The frozen `warnings` module implements `warn`, `warn_explicit`, `filterwarnings
 `always`, `ignore`, and `error` actions. A warning names the line executing `stacklevel` frames up.
 Every frame reports the script path, as tracebacks do, and `module=` filters match `__main__`.
 
-User-defined exception subclasses preserve inherited constructor arguments, including compatible
-`args`, `str`, and `repr` behavior.
+Exceptions keep their constructor arguments in `args`, which is writable, and derive `str` and
+`repr` from them as CPython does: a `KeyError` shows its key's `repr`, and a generator's return
+value becomes the `value` of the `StopIteration` that ends it. User-defined exception subclasses
+inherit the same behavior. Builtin exception instances do not accept other attributes, and
+`OSError`'s `errno`, `strerror`, and `filename`, `with_traceback`, and `add_note` are not
+modeled.
 
 Builtin operations raise ordinary Python exceptions with CPython 3.14's types, hierarchy, and
 messages, so `except LookupError` catches a missing dictionary key and an uncaught error exits with
@@ -110,7 +171,7 @@ attribute of a module, class, or instance raises `AttributeError`. Argument-bind
 function by `__name__`; CPython uses the qualified name for nested functions and methods.
 
 CPython behavior that shellsim does not model fails differently. An unimplemented builtin such as
-`eval`, an unimplemented standard-library module such as `threading`, or a missing method of a
+`memoryview`, an unimplemented standard-library module such as `threading`, or a missing method of a
 builtin value stops the program with exit status 2 and an "unsupported by minimal shim" diagnostic.
 These failures cannot be caught, so an `except ImportError` fallback cannot mistake a shellsim gap
 for functionality that is really absent.
@@ -135,9 +196,12 @@ inside the simulation when one becomes ready. Native async generators, async soc
 executors, host threads, text-mode subprocess streams, and custom event loops are not exposed;
 synchronous calls made inside a coroutine retain their usual blocking behavior.
 
-The bounded `pytest` runner supports ordinary and yield fixtures, fixture dependencies, literal
-`@pytest.mark.parametrize` cases, `tmp_path`/`tmpdir`, skip markers, `pytest.raises` with exception
-tuples and `match`, and explicit test files. Fixture scopes and dynamic parametrization remain outside this small runner. `unittest`
+The bounded `pytest` runner supports ordinary and yield fixtures, fixture dependencies,
+`@pytest.mark.parametrize`, `tmp_path`/`tmpdir`, skip markers, `pytest.raises` with exception
+tuples and `match`, `pytest.warns`, `pytest.approx` (numbers, lists, tuples, dicts and NumPy
+arrays), and explicit test files. Parametrized values are evaluated when the test module
+runs, so they may be any expression, and stacked decorators vary the topmost fastest, as in
+pytest. Fixture scopes, `pytest.param` and custom `ids` remain outside this small runner. `unittest`
 supports straightforward test classes. Unsupported syntax and runner features produce an error
 rather than a false passing result.
 
@@ -181,4 +245,5 @@ Do not add an importable placeholder for a module whose central contract is abse
 an empty `sqlite3` namespace is less useful than a clear import failure because callers otherwise
 cannot tell which database semantics are real.
 
-The minimal NumPy design follows these rules in [numpy.md](numpy.md).
+The NumPy and SciPy implementations follow these rules; see [numpy.md](numpy.md) and
+[scipy.md](scipy.md).

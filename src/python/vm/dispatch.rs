@@ -138,6 +138,13 @@ impl Vm<'_> {
                     ))
                 }
                 Opcode::StoreSubscript => dispatch_next(self.store_subscript()),
+                Opcode::DeleteAttribute(name) => {
+                    let symbol = self
+                        .symbol_for(code, code_cache, name)
+                        .map_err(|error| (error, dispatch.span()))?;
+                    let owner = self.pop().map_err(|error| (error, dispatch.span()))?;
+                    dispatch_next(self.delete_attribute_by_symbol(owner, symbol, code.name(name)))
+                }
                 Opcode::DeleteName(name) => {
                     let symbol = self
                         .symbol_for(code, code_cache, name)
@@ -278,6 +285,22 @@ impl Vm<'_> {
                         instruction_pointer + 1,
                     )))
                 }
+                Opcode::YieldFromSend(target) => match self.yield_from_send() {
+                    Ok(ForIterOutcome::Yielded) => {
+                        // Suspend at this instruction so the next `send` repeats the step.
+                        let value = self.pop().map_err(|error| (error, dispatch.span()))?;
+                        Ok(DispatchControl::Complete(Execution::Yield(
+                            value,
+                            instruction_pointer,
+                        )))
+                    }
+                    Ok(ForIterOutcome::Exhausted) => Ok(DispatchControl::Jump(target)),
+                    Ok(ForIterOutcome::Blocked(reason)) => {
+                        self.active_frame_mut().instruction_pointer = instruction_pointer;
+                        Ok(DispatchControl::Complete(Execution::Blocked(reason)))
+                    }
+                    Err(error) => Err(error),
+                },
                 Opcode::AwaitResult => self.dispatch_await_result(),
                 Opcode::RuntimeError(error) => Err(code.error(error).to_owned()),
                 Opcode::Assert => self.dispatch_assert(),

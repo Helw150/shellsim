@@ -183,6 +183,7 @@ pub enum Opcode {
     StoreGlobal(NameId),
     StoreAttribute(NameId),
     StoreSubscript,
+    DeleteAttribute(NameId),
     DeleteName(NameId),
     DeleteLocal(usize),
     DeleteGlobal(NameId),
@@ -246,6 +247,7 @@ pub enum Opcode {
     Raise(bool),
     RaiseFrom,
     Yield,
+    YieldFromSend(usize),
     AwaitResult,
     WithEnter,
     WithExit,
@@ -274,6 +276,7 @@ pub enum Operation {
     StoreGlobal(String),
     StoreAttribute(String),
     StoreSubscript,
+    DeleteAttribute(String),
     DeleteName(String),
     DeleteLocal(usize),
     DeleteGlobal(String),
@@ -358,6 +361,11 @@ pub enum Operation {
     RaiseFrom,
     /// Suspend a generator frame and return the value on top of the stack.
     Yield,
+    /// One step of `yield from`: pop the value sent into the generator and pass it to the
+    /// subiterator below it. A yielded value suspends the frame at this same instruction, so the
+    /// next `send` repeats the step; when the subiterator finishes, it is replaced by its return
+    /// value and control jumps to the target.
+    YieldFromSend(usize),
     /// Unwrap the scheduler outcome sent into a suspended coroutine.
     AwaitResult,
     WithEnter,
@@ -428,6 +436,7 @@ impl CodeBuilder {
             Operation::StoreGlobal(name) => Opcode::StoreGlobal(self.name(name)),
             Operation::StoreAttribute(name) => Opcode::StoreAttribute(self.name(name)),
             Operation::StoreSubscript => Opcode::StoreSubscript,
+            Operation::DeleteAttribute(name) => Opcode::DeleteAttribute(self.name(name)),
             Operation::DeleteName(name) => Opcode::DeleteName(self.name(name)),
             Operation::DeleteLocal(slot) => Opcode::DeleteLocal(slot),
             Operation::DeleteGlobal(name) => Opcode::DeleteGlobal(self.name(name)),
@@ -548,6 +557,7 @@ impl CodeBuilder {
             Operation::Raise(cause) => Opcode::Raise(cause),
             Operation::RaiseFrom => Opcode::RaiseFrom,
             Operation::Yield => Opcode::Yield,
+            Operation::YieldFromSend(target) => Opcode::YieldFromSend(target),
             Operation::AwaitResult => Opcode::AwaitResult,
             Operation::WithEnter => Opcode::WithEnter,
             Operation::WithExit => Opcode::WithExit,
@@ -577,9 +587,9 @@ impl CodeBuilder {
             })
             .count();
         let call_signature = CallSignature {
-            is_generator: instructions
-                .iter()
-                .any(|instruction| matches!(instruction.opcode, Opcode::Yield)),
+            is_generator: instructions.iter().any(|instruction| {
+                matches!(instruction.opcode, Opcode::Yield | Opcode::YieldFromSend(_))
+            }),
             is_coroutine,
             positional_count,
             variadic_slot: parameters

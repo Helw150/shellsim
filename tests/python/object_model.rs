@@ -70,6 +70,21 @@ fn int_subclasses_preserve_identity_and_use_numeric_protocols() {
 }
 
 #[test]
+fn subclassing_unmodeled_builtin_layouts_fails_loudly() {
+    // Only int and tuple instances carry a builtin payload. Other builtin bases must not fall
+    // back to a plain object layout that silently lacks list or dict behavior.
+    let (status, stdout, stderr) = run_python_text(
+        "try:\n    class Items(list):\n        pass\nexcept TypeError:\n    print('caught')",
+    );
+    assert_eq!(status, 2);
+    assert!(stdout.is_empty());
+    assert!(
+        stderr.contains("subclassing the builtin type 'list' is not supported"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn type_predicates_follow_user_mro_and_builtin_layouts() {
     assert_eq!(
         run_shell(
@@ -235,7 +250,7 @@ fn user_descriptors_follow_precedence_and_receive_set_name() {
 fn user_protocol_slots_dispatch_cached_dunder_methods() {
     assert_eq!(
         run_shell(
-            "python3.14 -c 'class NumberBox:\n    def __init__(self, value):\n        self.value = value\n    def __call__(self, amount):\n        return self.value + amount\n    def __add__(self, other):\n        return self.value + other\n    def __eq__(self, other):\n        return self.value == other\n    def __lt__(self, other):\n        return self.value < other\n    def __contains__(self, item):\n        return item == self.value\n    def __bool__(self):\n        return self.value != 0\n    def __str__(self):\n        return \"box\"\n    def __repr__(self):\n        return \"NumberBox\"\n    def __iter__(self):\n        return [self.value, self.value + 1]\nbox = NumberBox(4)\nzero = NumberBox(0)\nprint(box(3), box + 2, box == 4, box != 4, box != 5, box < 8, 4 in box)\nprint(bool(box), bool(zero), not zero)\nprint(str(box), repr(box), list(box))'"
+            "python3.14 -c 'class NumberBox:\n    def __init__(self, value):\n        self.value = value\n    def __call__(self, amount):\n        return self.value + amount\n    def __add__(self, other):\n        return self.value + other\n    def __eq__(self, other):\n        return self.value == other\n    def __lt__(self, other):\n        return self.value < other\n    def __contains__(self, item):\n        return item == self.value\n    def __bool__(self):\n        return self.value != 0\n    def __str__(self):\n        return \"box\"\n    def __repr__(self):\n        return \"NumberBox\"\n    def __iter__(self):\n        return iter([self.value, self.value + 1])\nbox = NumberBox(4)\nzero = NumberBox(0)\nprint(box(3), box + 2, box == 4, box != 4, box != 5, box < 8, 4 in box)\nprint(bool(box), bool(zero), not zero)\nprint(str(box), repr(box), list(box))'"
         ),
         (
             0,

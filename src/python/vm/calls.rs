@@ -1,13 +1,14 @@
 //! Call preparation, callable dispatch, argument binding, and Python frame entry.
 
+use super::super::ast::{Program, Statement, StatementKind};
 use super::{
-    expect_arity, protocol, range_length, BigInt, BinaryOperator, Builtin, BytecodeFrame, CallArgs,
-    CallMode, CallResult, ClassLayout, CodeRef, ComparisonOperator, Execution, FunctionInvocation,
-    FunctionReturn, HashMap, InstanceAttributes, InstancePayload, NativeValue, Object,
-    PendingNativeCall, PyError, PyErrorKind, PyRuntime, PyStreamRead, RaisedException, ScopeId,
-    Slot, Stream, Value, Vm,
+    expect_arity, protocol, range_length, BigInt, BinaryOperator, Builtin, BuiltinType,
+    BytecodeFrame, CallArgs, CallMode, CallResult, ClassLayout, CodeRef, ComparisonOperator,
+    ExceptionType, Execution, FunctionInvocation, FunctionReturn, HashMap, InstanceAttributes,
+    InstancePayload, NativeValue, Object, PendingNativeCall, PyError, PyErrorKind, PyRuntime,
+    PyStreamRead, RaisedException, ScopeId, Slot, Stream, Value, Vm,
 };
-use num_traits::{Signed, Zero};
+use num_traits::{One, Signed, Zero};
 
 impl Vm<'_> {
     /// The builtin `abs(value)`, through the `__abs__` slot.
@@ -22,6 +23,43 @@ impl Vm<'_> {
         Err(self.raise_exception("TypeError", message))
     }
 
+    /// Parse the source string passed to `exec` or `eval` (`builtin`). Parsing is charged
+    /// before it runs, and nesting is bounded so dynamic source cannot recurse without limit.
+    /// `eval` ignores leading spaces and tabs, as CPython does.
+    fn parse_dynamic_source(&mut self, builtin: &str, source: &Value) -> Result<Program, String> {
+        let source = protocol::string_value(&self.state.heap, source)?.ok_or_else(|| {
+            self.record_native_error(PyError::type_error(format!(
+                "{builtin}() arg 1 must be a string, bytes or code object"
+            )))
+        })?;
+        let source = if builtin == "eval" {
+            source.trim_start_matches([' ', '\t'])
+        } else {
+            &source
+        };
+        if self.bytecode_frames.len() >= 256 {
+            return Err(format!("maximum {builtin} depth exceeded"));
+        }
+        let parse_memory = source
+            .len()
+            .checked_mul(4)
+            .ok_or_else(|| format!("{builtin} source is too large"))?;
+        self.charge_cpu(u64::try_from(source.len()).unwrap_or(u64::MAX))?;
+        self.reserve_result(parse_memory)?;
+        let tokens = super::super::lexer::lex(source).map_err(|error| {
+            format!(
+                "{} at line {}, column {}",
+                error.message, error.span.line, error.span.column
+            )
+        })?;
+        super::super::parser::parse(tokens).map_err(|error| {
+            format!(
+                "{} at line {}, column {}",
+                error.message, error.span.line, error.span.column
+            )
+        })
+    }
+
     fn pow_integer_argument(&self, value: &Value) -> Result<(BigInt, usize), PyError> {
         let decimal = <Self as PyRuntime>::integer_text(self, value)?.ok_or_else(|| {
             PyError::type_error("pow() 3rd argument not allowed unless all arguments are integers")
@@ -30,6 +68,36 @@ impl Vm<'_> {
             .parse::<BigInt>()
             .map_err(|_| PyError::runtime_error("invalid internal integer representation"))?;
         Ok((integer, decimal.len()))
+    }
+
+    /// `dir(value)` through a `__dir__` that the value's class defines: the names it returns,
+    /// sorted, or `None` when the class defines none.
+    fn custom_dir(&mut self, value: &Value) -> Result<Option<Value>, String> {
+        let Some(id) = value.object_id() else {
+            return Ok(None);
+        };
+        let Object::Instance { class, .. } = self.state.heap.get(id)? else {
+            return Ok(None);
+        };
+        let class = *class;
+        if self.class_attribute(class, "__dir__")?.is_none() {
+            return Ok(None);
+        }
+        let method = self
+            .resolve_attribute(*value, "__dir__")?
+            .ok_or("__dir__ disappeared during lookup")?;
+        let result = self.invoke_value(method, Vec::new())?;
+        let mut names = Vec::new();
+        for item in self.iterable_values(&result)? {
+            let Some(name) = protocol::string_value(&self.state.heap, &item)? else {
+                return Err(self.raise_exception("TypeError", "__dir__() must return strings"));
+            };
+            names.push((name, item));
+        }
+        self.charge_cpu(u64::try_from(names.len()).unwrap_or(u64::MAX))?;
+        names.sort_by(|left, right| left.0.cmp(&right.0));
+        let values = names.into_iter().map(|(_, item)| item).collect();
+        self.allocate_object(Object::List(values)).map(Some)
     }
 
     fn dir_names(&self, value: &Value) -> Result<Vec<String>, String> {
@@ -117,7 +185,8 @@ impl Vm<'_> {
             let additions = match (name, expanded) {
                 (Some(name), false) => vec![(name.clone(), value)],
                 (None, true) => {
-                    let entries = match value
+                    let entries = match self
+                        .builtin_view(value)?
                         .object_id()
                         .map(|id| self.state.heap.get(id).cloned())
                         .transpose()?
@@ -153,6 +222,11 @@ impl Vm<'_> {
             }
         }
         let function = self.pop()?;
+        if let Some(call) = self.registered_kind(&function).and_then(|kind| kind.call) {
+            return call(self, function, CallArgs::new(arguments, keyword_arguments))
+                .map(CallResult::Value)
+                .map_err(|error| self.record_native_error(error));
+        }
         if let Some(id) = function.object_id() {
             return match self.state.heap.get(id)?.clone() {
                 Object::Function {
@@ -161,6 +235,7 @@ impl Vm<'_> {
                     closure,
                     defaults,
                     defining_class,
+                    ..
                 } => {
                     let method_frame = defining_class.zip(arguments.first().cloned());
                     if let Some((owner, receiver)) = method_frame {
@@ -314,27 +389,38 @@ impl Vm<'_> {
                         }
                         return Err(format!("value is not a valid {name}"));
                     }
+                    if layout != ClassLayout::Type && exception_base.is_none() && !is_dataclass {
+                        if let Some((owner, constructor)) =
+                            self.class_attribute_entry(id, "__new__")?
+                        {
+                            return self.construct_with_new(
+                                id,
+                                owner,
+                                constructor,
+                                arguments,
+                                keyword_arguments,
+                            );
+                        }
+                    }
                     let payload = match layout {
                         ClassLayout::Object => InstancePayload::Object,
-                        ClassLayout::Int => {
-                            if !keyword_arguments.is_empty() {
-                                return Err(format!("{name}() does not accept keyword arguments"));
-                            }
-                            let value = arguments
-                                .first()
-                                .map(|value| {
-                                    protocol::int_value(&self.state.heap, value)
-                                        .or_else(|| value.as_int())
-                                        .ok_or_else(|| {
-                                            format!("{name}() argument is not supported")
-                                        })
-                                })
-                                .transpose()?
-                                .unwrap_or(0);
-                            if arguments.len() > 1 {
-                                return Err(format!("{name}() expects at most one value"));
-                            }
-                            InstancePayload::Int(value)
+                        // A dict subclass with its own `__init__` starts empty and fills itself
+                        // through `super().__init__`, since `dict.__new__` ignores arguments.
+                        ClassLayout::Builtin(BuiltinType::Dict)
+                            if self.class_attribute(id, "__init__")?.is_some() =>
+                        {
+                            InstancePayload::Builtin(self.builtin_value(
+                                BuiltinType::Dict,
+                                Vec::new(),
+                                Vec::new(),
+                            )?)
+                        }
+                        ClassLayout::Builtin(builtin) => {
+                            InstancePayload::Builtin(self.builtin_value(
+                                builtin,
+                                arguments.clone(),
+                                keyword_arguments.clone(),
+                            )?)
                         }
                         ClassLayout::Type => {
                             let created = if let Some((owner, constructor)) =
@@ -487,6 +573,7 @@ impl Vm<'_> {
                             closure,
                             defaults,
                             defining_class,
+                            ..
                         } = self.state.heap.get(function)?.clone()
                         else {
                             return Err(format!("{name}.__init__ is not a function"));
@@ -547,15 +634,16 @@ impl Vm<'_> {
                 .map_err(|error| self.record_native_error(error));
         }
         if let Some(NativeValue::ExceptionType(exception_type)) = function.native_value() {
-            expect_arity(&arguments, 0, 1)?;
-            let message = arguments
-                .first()
-                .map(|value| protocol::display(&self.state.heap, value))
-                .transpose()?
-                .unwrap_or_default();
-            return Ok(CallResult::Value(
-                self.allocate_exception(exception_type.0.to_string(), message)?,
-            ));
+            if !keyword_arguments.is_empty() {
+                let message = format!("{}() takes no keyword arguments", exception_type.0);
+                return Err(self.raise_exception("TypeError", message));
+            }
+            return Ok(CallResult::Value(self.allocate_object(
+                Object::Exception {
+                    kind: exception_type.0.to_string(),
+                    args: arguments,
+                },
+            )?));
         }
         if let Some(NativeValue::NativeMethod(method)) = function.native_value() {
             if arguments.is_empty() {
@@ -709,33 +797,7 @@ impl Vm<'_> {
             }
             Builtin::Exec => {
                 expect_arity(&arguments, 1, 1)?;
-                let source =
-                    protocol::string_value(&self.state.heap, &arguments[0])?.ok_or_else(|| {
-                        self.record_native_error(PyError::type_error(
-                            "exec() argument must be a string",
-                        ))
-                    })?;
-                if self.bytecode_frames.len() >= 256 {
-                    return Err("maximum exec depth exceeded".into());
-                }
-                let parse_memory = source
-                    .len()
-                    .checked_mul(4)
-                    .ok_or("exec source is too large")?;
-                self.charge_cpu(u64::try_from(source.len()).unwrap_or(u64::MAX))?;
-                self.reserve_result(parse_memory)?;
-                let tokens = super::super::lexer::lex(&source).map_err(|error| {
-                    format!(
-                        "{} at line {}, column {}",
-                        error.message, error.span.line, error.span.column
-                    )
-                })?;
-                let program = super::super::parser::parse(tokens).map_err(|error| {
-                    format!(
-                        "{} at line {}, column {}",
-                        error.message, error.span.line, error.span.column
-                    )
-                })?;
+                let program = self.parse_dynamic_source("exec", &arguments[0])?;
                 let code = super::super::compiler::compile(program);
                 match self.execute_code(&code) {
                     Ok(Execution::Halt) => Ok(CallResult::Value(Value::None)),
@@ -748,6 +810,32 @@ impl Vm<'_> {
                     ) => Err("exec source did not finish normally".into()),
                     Err((error, span)) => Err(format!(
                         "{error} in exec source at line {}, column {}",
+                        span.line, span.column
+                    )),
+                }
+            }
+            Builtin::Eval => {
+                expect_arity(&arguments, 1, 1)?;
+                let mut program = self.parse_dynamic_source("eval", &arguments[0])?;
+                let expression = match program.statements.pop() {
+                    Some(Statement {
+                        kind: StatementKind::Expression(expression),
+                        ..
+                    }) if program.statements.is_empty() => expression,
+                    _ => return Err(self.raise_exception("SyntaxError", "invalid syntax")),
+                };
+                let code = super::super::compiler::compile_expression(expression);
+                match self.execute_code(&code) {
+                    Ok(Execution::Return(value)) => Ok(CallResult::Value(value)),
+                    Ok(Execution::Exit(status)) => Ok(CallResult::Exit(status)),
+                    Ok(
+                        Execution::Halt
+                        | Execution::Pending
+                        | Execution::Blocked(_)
+                        | Execution::Yield(_, _),
+                    ) => Err("eval source did not finish normally".into()),
+                    Err((error, span)) => Err(format!(
+                        "{error} in eval source at line {}, column {}",
                         span.line, span.column
                     )),
                 }
@@ -871,6 +959,11 @@ impl Vm<'_> {
             }
             Builtin::Dir => {
                 expect_arity(&arguments, 0, 1)?;
+                if let Some(value) = arguments.first() {
+                    if let Some(names) = self.custom_dir(value)? {
+                        return Ok(CallResult::Value(names));
+                    }
+                }
                 let mut names = if let Some(value) = arguments.first() {
                     self.dir_names(value)?
                 } else {
@@ -928,58 +1021,60 @@ impl Vm<'_> {
                     }
                     return Ok(CallResult::Value(Value::Int(length)));
                 }
-                let length = if let Some(length) =
-                    protocol::string_length(&self.state.heap, &arguments[0])?
-                {
-                    Some(length)
-                } else if let Some(id) = arguments[0].object_id() {
-                    match self.state.heap.get(id)? {
-                        Object::Bare => None,
-                        Object::List(values)
-                        | Object::Tuple(values)
-                        | Object::Set(values)
-                        | Object::FrozenSet(values) => Some(values.len()),
-                        Object::Range { start, stop, step } => {
-                            Some(range_length(*start, *stop, *step)?)
+                let subject = self.builtin_view(arguments[0])?;
+                let length =
+                    if let Some(length) = protocol::string_length(&self.state.heap, &subject)? {
+                        Some(length)
+                    } else if let Some(id) = subject.object_id() {
+                        match self.state.heap.get(id)? {
+                            Object::Bare => None,
+                            Object::List(values)
+                            | Object::Tuple(values)
+                            | Object::Set(values)
+                            | Object::FrozenSet(values) => Some(values.len()),
+                            Object::Range { start, stop, step } => {
+                                Some(range_length(*start, *stop, *step)?)
+                            }
+                            Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
+                                Some(entries.len())
+                            }
+                            Object::BigInt(_)
+                            | Object::Complex { .. }
+                            | Object::String(_)
+                            | Object::Bytes(_)
+                            | Object::ByteArray(_)
+                            | Object::Slice { .. }
+                            | Object::Exception { .. }
+                            | Object::Function { .. }
+                            | Object::Class { .. }
+                            | Object::Instance { .. }
+                            | Object::DescriptorBoundMethod { .. }
+                            | Object::Iterator { .. }
+                            | Object::SequenceIterator { .. }
+                            | Object::RangeIterator { .. }
+                            | Object::CountIterator { .. }
+                            | Object::StreamIterator { .. }
+                            | Object::CallableIterator { .. }
+                            | Object::Generator { .. }
+                            | Object::Module { .. }
+                            | Object::ArrayStorage(_)
+                            | Object::Array { .. }
+                            | Object::WideValue { .. }
+                            | Object::Regex { .. }
+                            | Object::Match { .. }
+                            | Object::ArgumentParser { .. }
+                            | Object::Namespace { .. }
+                            | Object::EnumMember { .. }
+                            | Object::RaisesContext { .. }
+                            | Object::Property { .. }
+                            | Object::StaticMethod { .. }
+                            | Object::ClassMethod { .. }
+                            | Object::Super { .. }
+                            | Object::Globals(_) => None,
                         }
-                        Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
-                            Some(entries.len())
-                        }
-                        Object::BigInt(_)
-                        | Object::Complex { .. }
-                        | Object::String(_)
-                        | Object::Bytes(_)
-                        | Object::ByteArray(_)
-                        | Object::Slice { .. }
-                        | Object::Exception { .. }
-                        | Object::Function { .. }
-                        | Object::Class { .. }
-                        | Object::Instance { .. }
-                        | Object::DescriptorBoundMethod { .. }
-                        | Object::Iterator { .. }
-                        | Object::SequenceIterator { .. }
-                        | Object::RangeIterator { .. }
-                        | Object::CountIterator { .. }
-                        | Object::StreamIterator { .. }
-                        | Object::CallableIterator { .. }
-                        | Object::Generator { .. }
-                        | Object::Module { .. }
-                        | Object::ArrayStorage(_)
-                        | Object::Array { .. }
-                        | Object::Regex { .. }
-                        | Object::Match { .. }
-                        | Object::ArgumentParser { .. }
-                        | Object::Namespace { .. }
-                        | Object::EnumMember { .. }
-                        | Object::RaisesContext { .. }
-                        | Object::Property { .. }
-                        | Object::StaticMethod { .. }
-                        | Object::ClassMethod { .. }
-                        | Object::Super { .. } => None,
-                    }
-                } else {
-                    None
-                };
+                    } else {
+                        None
+                    };
                 let Some(length) = length else {
                     let message = format!(
                         "object of type '{}' has no len()",
@@ -1154,11 +1249,20 @@ impl Vm<'_> {
                         let error = PyError::zero_division_error("pow() 3rd argument cannot be 0");
                         return Err(self.record_native_error(error));
                     }
-                    if exponent.is_negative() {
-                        let error =
-                            PyError::value_error("negative exponent with modulus is not supported");
-                        return Err(self.record_native_error(error));
-                    }
+                    let positive_modulus = modulus.abs();
+                    // As in CPython, `pow(b, -e, m)` is `pow(inverse(b), e, m)`, and every
+                    // value is its own inverse modulo one.
+                    let (base, exponent) = if !exponent.is_negative() {
+                        (base, exponent)
+                    } else if positive_modulus.is_one() {
+                        (BigInt::zero(), -exponent)
+                    } else {
+                        let Some(inverse) = base.modinv(&positive_modulus) else {
+                            let message = "base is not invertible for the given modulus";
+                            return Err(self.record_native_error(PyError::value_error(message)));
+                        };
+                        (inverse, -exponent)
+                    };
                     let work = base_len
                         .saturating_add(modulus_len)
                         .saturating_mul(exponent_len.saturating_mul(4).max(1));
@@ -1166,7 +1270,6 @@ impl Vm<'_> {
                         .map_err(|error| error.to_string())?;
                     <Self as PyRuntime>::reserve_memory(self, modulus_len.saturating_mul(4).max(1))
                         .map_err(|error| error.to_string())?;
-                    let positive_modulus = modulus.abs();
                     let mut result = base.modpow(&exponent, &positive_modulus);
                     if modulus.is_negative() && !result.is_zero() {
                         result += modulus;
@@ -1207,6 +1310,25 @@ impl Vm<'_> {
                 self.store_attribute_by_symbol(arguments[0], symbol, &name, arguments[2])?;
                 Ok(CallResult::Value(Value::None))
             }
+            Builtin::DeleteAttribute => {
+                if arguments.len() != 2 {
+                    let message = format!("delattr expected 2 arguments, got {}", arguments.len());
+                    return Err(self.raise_exception("TypeError", message));
+                }
+                let Some(name) = protocol::string_value(&self.state.heap, &arguments[1])? else {
+                    let message = format!(
+                        "attribute name must be string, not '{}'",
+                        self.type_name_of(&arguments[1])?
+                    );
+                    return Err(self.raise_exception("TypeError", message));
+                };
+                let symbol = self
+                    .state
+                    .heap
+                    .intern_symbol(&name, &mut self.interp.resources)?;
+                self.delete_attribute_by_symbol(arguments[0], symbol, &name)?;
+                Ok(CallResult::Value(Value::None))
+            }
             Builtin::Callable => {
                 expect_arity(&arguments, 1, 1)?;
                 let callable = <Self as PyRuntime>::is_callable(self, &arguments[0])
@@ -1245,7 +1367,7 @@ impl Vm<'_> {
                     Some(value) => value,
                     None => match arguments.get(1) {
                         Some(default) => *default,
-                        None => return Err(self.raise_exception("StopIteration", "")),
+                        None => return Err(self.raise_stop_iteration(&arguments[0])),
                     },
                 };
                 Ok(CallResult::Value(value))
@@ -1353,6 +1475,13 @@ impl Vm<'_> {
                     start_class,
                     receiver,
                 })?))
+            }
+            Builtin::Globals => {
+                expect_arity(&arguments, 0, 0)?;
+                let target = self.current_globals_target()?;
+                Ok(CallResult::Value(
+                    self.allocate_object(Object::Globals(target))?,
+                ))
             }
         }
     }
@@ -1607,6 +1736,215 @@ impl Vm<'_> {
     /// Advance any Python iterator by one item; `Ok(None)` means a builtin iterator is exhausted.
     /// A user iterator's `StopIteration` stays pending as an error, so callers that treat it as
     /// exhaustion check [`Self::pending_stop_iteration`].
+    /// Instantiate a class whose MRO defines `__new__`, as `type.__call__` does: call `__new__`
+    /// with the class and the call's arguments, then run `__init__` with the same arguments
+    /// when the result is an instance of the class. Any other result is returned as is.
+    fn construct_with_new(
+        &mut self,
+        class: super::super::heap::ObjectId,
+        owner: super::super::heap::ObjectId,
+        constructor: Value,
+        arguments: Vec<Value>,
+        keyword_arguments: Vec<(String, Value)>,
+    ) -> Result<CallResult, String> {
+        // `__new__` is a static method that receives the class explicitly.
+        let constructor = self.bind_descriptor(constructor, None, class, owner)?;
+        let mut new_arguments = Vec::with_capacity(arguments.len().saturating_add(1));
+        new_arguments.push(Value::Object(class));
+        new_arguments.extend(arguments.iter().copied());
+        let created =
+            match self.invoke_call(constructor, new_arguments, keyword_arguments.clone())? {
+                CallResult::Value(value) => value,
+                CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
+                CallResult::EnteredFrame => unreachable!("invoke_call is immediate"),
+                CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
+                    unreachable!("immediate call cannot suspend")
+                }
+            };
+        if !self.is_instance(&created, &Value::Object(class))? {
+            return Ok(CallResult::Value(created));
+        }
+        let Some((owner, initializer)) = self.class_attribute_entry(class, "__init__")? else {
+            return Ok(CallResult::Value(created));
+        };
+        let initializer = self.bind_descriptor(initializer, Some(created), class, owner)?;
+        match self.invoke_call(initializer, arguments, keyword_arguments)? {
+            CallResult::Value(value) if value.is_none() => Ok(CallResult::Value(created)),
+            CallResult::Value(value) => {
+                let type_name = self.type_name_of(&value)?;
+                Err(self.raise_exception(
+                    "TypeError",
+                    format!("__init__() should return None, not '{type_name}'"),
+                ))
+            }
+            CallResult::Exit(status) => Ok(CallResult::Exit(status)),
+            CallResult::EnteredFrame => unreachable!("invoke_call is immediate"),
+            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
+                unreachable!("immediate call cannot suspend")
+            }
+        }
+    }
+
+    /// The value `builtin(*arguments, **keyword_arguments)` constructs, such as the tuple that
+    /// `tuple(iterable)` builds.
+    fn builtin_value(
+        &mut self,
+        builtin: BuiltinType,
+        arguments: Vec<Value>,
+        keyword_arguments: Vec<(String, Value)>,
+    ) -> Result<Value, String> {
+        match self.call_builtin_type(builtin, arguments, keyword_arguments)? {
+            CallResult::Value(value) => Ok(value),
+            _ => Err(format!("{}() did not produce a value", builtin.name())),
+        }
+    }
+
+    /// `builtin.__new__(class, ...)` for a builtin type that user classes may derive from, such
+    /// as `tuple.__new__(cls, iterable)`: the builtin value itself when `class` is `builtin`, and
+    /// otherwise an instance of the subclass `class` that holds the value.
+    pub(super) fn new_builtin_instance(
+        &mut self,
+        builtin: BuiltinType,
+        class: Value,
+        arguments: Vec<Value>,
+        keyword_arguments: Vec<(String, Value)>,
+    ) -> Result<Value, String> {
+        let name = builtin.name();
+        let subclass = match class.native_value() {
+            Some(NativeValue::BuiltinType(class_type)) if class_type == builtin => None,
+            Some(
+                native @ (NativeValue::BuiltinType(_)
+                | NativeValue::ExceptionType(_)
+                | NativeValue::ValueKind(_)),
+            ) => {
+                let class_name = match native {
+                    NativeValue::BuiltinType(class_type) => class_type.name(),
+                    NativeValue::ExceptionType(ExceptionType(class_name)) => class_name,
+                    NativeValue::ValueKind(kind) => kind
+                        .name
+                        .rsplit_once('.')
+                        .map_or(kind.name, |(_, class_name)| class_name),
+                    _ => unreachable!("matched above"),
+                };
+                let message = format!(
+                    "{name}.__new__({class_name}): {class_name} is not a subtype of {name}"
+                );
+                return Err(self.raise_exception("TypeError", message));
+            }
+            _ => match class.object_id().map(|id| (id, self.state.heap.get(id))) {
+                Some((
+                    id,
+                    Ok(Object::Class {
+                        layout: ClassLayout::Builtin(layout),
+                        ..
+                    }),
+                )) if *layout == builtin => Some(id),
+                Some((
+                    _,
+                    Ok(Object::Class {
+                        name: class_name, ..
+                    }),
+                )) => {
+                    let message = format!(
+                        "{name}.__new__({class_name}): {class_name} is not a subtype of {name}"
+                    );
+                    return Err(self.raise_exception("TypeError", message));
+                }
+                _ => {
+                    let type_name = self.type_name_of(&class)?;
+                    let message =
+                        format!("{name}.__new__(X): X is not a type object ({type_name})");
+                    return Err(self.raise_exception("TypeError", message));
+                }
+            },
+        };
+        let value = self.builtin_value(builtin, arguments, keyword_arguments)?;
+        let Some(class) = subclass else {
+            return Ok(value);
+        };
+        self.allocate_object(Object::Instance {
+            class,
+            payload: InstancePayload::Builtin(value),
+            attributes: InstanceAttributes::default(),
+        })
+    }
+
+    /// `object.__new__(class)`: a new instance of `class` with no attributes set.
+    ///
+    /// As in CPython, extra arguments are an error when the class overrides `__new__` (they were
+    /// meant for it) or when it keeps `object.__init__` (nothing would accept them). A class whose
+    /// instances have a builtin layout, such as an `int` or exception subclass, must be created
+    /// by that builtin's `__new__`.
+    pub(super) fn new_instance(
+        &mut self,
+        class: Value,
+        has_arguments: bool,
+    ) -> Result<Value, String> {
+        if matches!(
+            class.native_value(),
+            Some(NativeValue::BuiltinType(BuiltinType::Object))
+        ) {
+            if has_arguments {
+                return Err(self.raise_exception("TypeError", "object() takes no arguments"));
+            }
+            return self.allocate_object(Object::Bare);
+        }
+        let builtin = match class.native_value() {
+            Some(NativeValue::BuiltinType(builtin)) => Some(builtin.name()),
+            Some(NativeValue::ExceptionType(ExceptionType(name))) => Some(name),
+            _ => None,
+        };
+        if let Some(name) = builtin {
+            return Err(self.raise_exception(
+                "TypeError",
+                format!("object.__new__({name}) is not safe, use {name}.__new__()"),
+            ));
+        }
+        let Some((id, name, layout, exception_base)) =
+            class
+                .object_id()
+                .and_then(|id| match self.state.heap.get(id) {
+                    Ok(Object::Class {
+                        name,
+                        layout,
+                        exception_base,
+                        ..
+                    }) => Some((id, name.clone(), *layout, *exception_base)),
+                    _ => None,
+                })
+        else {
+            let type_name = self.type_name_of(&class)?;
+            return Err(self.raise_exception(
+                "TypeError",
+                format!("object.__new__(X): X is not a type object ({type_name})"),
+            ));
+        };
+        if layout != ClassLayout::Object || exception_base.is_some() {
+            return Err(self.raise_exception(
+                "TypeError",
+                format!("object.__new__({name}) is not safe, use {name}.__new__()"),
+            ));
+        }
+        if has_arguments {
+            if self.class_attribute_entry(id, "__new__")?.is_some() {
+                return Err(self.raise_exception(
+                    "TypeError",
+                    "object.__new__() takes exactly one argument (the type to instantiate)",
+                ));
+            }
+            if self.class_attribute_entry(id, "__init__")?.is_none() {
+                return Err(
+                    self.raise_exception("TypeError", format!("{name}() takes no arguments"))
+                );
+            }
+        }
+        self.allocate_object(Object::Instance {
+            class: id,
+            payload: InstancePayload::Object,
+            attributes: InstanceAttributes::default(),
+        })
+    }
+
     pub(super) fn iterator_next(&mut self, iterator: &Value) -> Result<Option<Value>, String> {
         let Some(id) = iterator.object_id() else {
             return Err(self.raise_object_type_error(iterator, "is not an iterator"));
@@ -1650,7 +1988,8 @@ impl Vm<'_> {
             Object::Generator { .. } => self.resume_generator(id)?,
             Object::Iterator { .. }
             | Object::SequenceIterator { .. }
-            | Object::RangeIterator { .. } => self.next_stored_iterator(id)?,
+            | Object::RangeIterator { .. }
+            | Object::StreamIterator { .. } => self.next_stored_iterator(id)?,
             _ => match self.invoke_slot(iterator, Slot::Next, "__next__", Vec::new())? {
                 Some(value) => Some(value),
                 None => return Err(self.raise_object_type_error(iterator, "is not an iterator")),

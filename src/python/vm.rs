@@ -20,17 +20,18 @@ use super::cpython_names;
 use super::exception_types;
 use super::filesystem::PyModuleLoader;
 use super::heap::{
-    ClassLayout, InstanceAttributeSlot, InstanceAttributes, InstancePayload, Object, ObjectId,
-    ScopeId, SymbolId, MODELED_MAPPING_ENTRY_BYTES, MODELED_VALUE_BYTES,
+    ClassLayout, GlobalsTarget, InstanceAttributeSlot, InstanceAttributes, InstancePayload, Object,
+    ObjectId, ScopeId, SymbolId, MODELED_MAPPING_ENTRY_BYTES, MODELED_VALUE_BYTES,
 };
 use super::native::{
     CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentParserData, PyArgumentSpec,
-    PyArray, PyArrayDtype, PyArrayLayout, PyBinaryOp, PyByteArray, PyCallable, PyClass, PyClock,
-    PyDict, PyEnvironment, PyError, PyErrorKind, PyFilesystem, PyHttpClient, PyIdentity,
-    PyIterator, PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyModule, PyNativeKind,
-    PyProcessHandle, PyProcessOutput, PyProcessPoll, PyProcessRunner, PyProcessStartRequest,
-    PyProperty, PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet, PyStreamRead,
-    PySubcommandSpec, PySubparsersSpec, PyTuple, PyValueCast,
+    PyArray, PyArrayBuffer, PyArrayData, PyArrayDataMut, PyArrayDtype, PyArrayMut, PyArrayRef,
+    PyArrayView, PyByteArray, PyCallable, PyClass, PyClock, PyDict, PyEnvironment, PyError,
+    PyErrorKind, PyFilesystem, PyGlobals, PyHttpClient, PyIdentity, PyIterator, PyKind, PyList,
+    PyMarker, PyMatch, PyMatchData, PyModule, PyNativeKind, PyOperator, PyProcessHandle,
+    PyProcessOutput, PyProcessPoll, PyProcessRunner, PyProcessStartRequest, PyProperty,
+    PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet, PyStreamRead, PySubcommandSpec,
+    PySubparsersSpec, PyTuple, PyTypeObject, PyValueCast,
 };
 use super::number;
 use super::object_model::{BuiltinType, Slot, SlotValue, TypeId};
@@ -225,7 +226,12 @@ impl NativeValue {
         match self {
             Self::BuiltinType(builtin_type) => format!("<class '{}'>", builtin_type.name()),
             Self::ValueKind(kind) => format!("<class '{}'>", kind.name),
-            Self::ExceptionType(ExceptionType(name)) => format!("<class '{name}'>"),
+            Self::ExceptionType(ExceptionType(name)) => {
+                match exception_types::exception_type(name).map(|definition| definition.module) {
+                    Some(module) if module != "builtins" => format!("<class '{module}.{name}'>"),
+                    _ => format!("<class '{name}'>"),
+                }
+            }
             Self::NativeGetter(getter) => format!("{getter:?}"),
             Self::Ellipsis => "Ellipsis".into(),
             Self::NotImplemented => "NotImplemented".into(),
@@ -284,6 +290,7 @@ pub(super) enum Builtin {
     Print,
     Input,
     Exec,
+    Eval,
     Exit,
     Character,
     Ordinal,
@@ -316,6 +323,8 @@ pub(super) enum Builtin {
     ClassMethod,
     Super,
     SetAttribute,
+    DeleteAttribute,
+    Globals,
 }
 
 /// The builtin functions the VM implements itself, by Python name. `exit` and `quit` share one.
@@ -323,6 +332,7 @@ pub(super) const BUILTIN_FUNCTIONS: &[(&str, Builtin)] = &[
     ("print", Builtin::Print),
     ("input", Builtin::Input),
     ("exec", Builtin::Exec),
+    ("eval", Builtin::Eval),
     ("exit", Builtin::Exit),
     ("quit", Builtin::Exit),
     ("chr", Builtin::Character),
@@ -356,6 +366,8 @@ pub(super) const BUILTIN_FUNCTIONS: &[(&str, Builtin)] = &[
     ("classmethod", Builtin::ClassMethod),
     ("super", Builtin::Super),
     ("setattr", Builtin::SetAttribute),
+    ("delattr", Builtin::DeleteAttribute),
+    ("globals", Builtin::Globals),
 ];
 
 impl Builtin {
@@ -637,7 +649,8 @@ enum IteratorAdvance {
         sentinel: Value,
     },
     Generator,
-    Invalid,
+    /// An object of a class that defines `__next__`, advanced by calling it.
+    Protocol,
     /// Advancing a `StreamIterator` would block on fd 0; suspend the enclosing `for` loop.
     Blocked(crate::scheduler::WaitReason),
 }
@@ -969,8 +982,36 @@ impl<'a> Vm<'a> {
         self.allocate_object(Object::ByteArray(value))
     }
 
+    /// A builtin exception whose only argument is `message`, or with no arguments when the
+    /// message is empty, as the VM and native code raise them.
     fn allocate_exception(&mut self, kind: String, message: String) -> Result<Value, String> {
-        self.allocate_object(Object::Exception { kind, message })
+        let args = if message.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.allocate_string(message)?]
+        };
+        self.allocate_object(Object::Exception { kind, args })
+    }
+
+    /// Raise a builtin exception with the constructor arguments `args`.
+    fn raise_exception_args(&mut self, kind: &str, args: Vec<Value>) -> String {
+        let value = match self.allocate_object(Object::Exception {
+            kind: kind.to_string(),
+            args,
+        }) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        let message = protocol::exception_parts(&self.state.heap, &value)
+            .ok()
+            .flatten()
+            .map(|(_, message)| message)
+            .unwrap_or_default();
+        self.pending_exception = Some(RaisedException {
+            kind: kind.to_string(),
+            value,
+        });
+        message
     }
 
     /// Raise a builtin Python exception from VM code and return the error string that carries
@@ -1044,36 +1085,15 @@ impl<'a> Vm<'a> {
     }
 
     fn iterable_values(&mut self, value: &Value) -> Result<Vec<Value>, String> {
-        // A class that sets `__iter__ = None` declares its instances not iterable, even when it
-        // defines `__getitem__`.
-        if matches!(
-            self.state.types.slot(self.type_id(value)?, Slot::Iter)?,
-            Some(SlotValue::Descriptor(Value::None))
-        ) {
-            return Err(self.raise_object_type_error(value, "is not iterable"));
-        }
-        if let Some(iterable) = self.invoke_slot(value, Slot::Iter, "__iter__", Vec::new())? {
-            if protocol::identical(value, &iterable) {
-                let mut result = Vec::new();
-                loop {
-                    match self.invoke_slot(&iterable, Slot::Next, "__next__", Vec::new()) {
-                        Ok(Some(item)) => self.push_materialized(&mut result, item)?,
-                        Ok(None) => return Err("iterator does not define __next__".into()),
-                        Err(_error)
-                            if self
-                                .pending_exception
-                                .as_ref()
-                                .is_some_and(|exception| exception.kind == "StopIteration") =>
-                        {
-                            self.pending_exception = None;
-                            break;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-                return Ok(result);
+        if let Some(iterator) = self.class_iterator(value)? {
+            let mut result = Vec::new();
+            while let Some(item) = self.next_until_stop(&iterator)? {
+                self.push_materialized(&mut result, item)?;
             }
-            return self.iterable_values(&iterable);
+            return Ok(result);
+        }
+        if let Some(value) = protocol::builtin_payload(&self.state.heap, value)? {
+            return self.iterable_values(&value);
         }
         let mut result = Vec::new();
         if let Some(value) = protocol::string_value(&self.state.heap, value)? {
@@ -1417,7 +1437,6 @@ enum SequenceKind {
 struct ClassDefinition {
     name: String,
     bases: Vec<Value>,
-    user_bases: Vec<super::heap::ObjectId>,
     mro: Vec<super::heap::ObjectId>,
     metaclass: Value,
     layout: ClassLayout,

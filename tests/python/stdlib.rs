@@ -242,6 +242,60 @@ except TypeError:
 }
 
 #[test]
+fn math_perm_counts_ordered_selections_exactly() {
+    let source = r#"import math
+n = 10 ** 20
+print(math.perm(5, 2), math.perm(5), math.perm(5, None), math.perm(3, 4), math.perm(0, 0))
+print(math.perm(n, 2) == n * (n - 1))
+for left, right in ((-1, 0), (3, -1)):
+    try:
+        math.perm(left, right)
+    except ValueError as error:
+        print(str(error))
+try:
+    math.perm(3.0, 2)
+except TypeError:
+    print("TypeError")
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            b"20 120 120 0 1\nTrue\nn must be a non-negative integer\nk must be a non-negative integer\nTypeError\n".to_vec(),
+            Vec::new()
+        )
+    );
+}
+
+#[test]
+fn private_introspection_lists_parameters_like_inspect_signature() {
+    let source = r#"from _shellsim_introspect import parameters
+class A:
+    def f(self, x, k, /, m=3, *args, n, o=5, **kw):
+        pass
+    def g(*args):
+        pass
+    def h():
+        pass
+print(parameters(A.f))
+print(parameters(A().f))
+print(parameters(A().g), parameters(len), parameters(lambda x, y=[2]: 0))
+try:
+    parameters(A().h)
+except ValueError as error:
+    print(error)
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            b"[('self', 'POSITIONAL_ONLY', False, None), ('x', 'POSITIONAL_ONLY', False, None), ('k', 'POSITIONAL_ONLY', False, None), ('m', 'POSITIONAL_OR_KEYWORD', True, 3), ('args', 'VAR_POSITIONAL', False, None), ('n', 'KEYWORD_ONLY', False, None), ('o', 'KEYWORD_ONLY', True, 5), ('kw', 'VAR_KEYWORD', False, None)]\n[('x', 'POSITIONAL_ONLY', False, None), ('k', 'POSITIONAL_ONLY', False, None), ('m', 'POSITIONAL_OR_KEYWORD', True, 3), ('args', 'VAR_POSITIONAL', False, None), ('n', 'KEYWORD_ONLY', False, None), ('o', 'KEYWORD_ONLY', True, 5), ('kw', 'VAR_KEYWORD', False, None)]\n[('args', 'VAR_POSITIONAL', False, None)] None [('x', 'POSITIONAL_OR_KEYWORD', False, None), ('y', 'POSITIONAL_OR_KEYWORD', True, [2])]\ninvalid method signature\n".to_vec(),
+            Vec::new()
+        )
+    );
+}
+
+#[test]
 fn math_prod_multiplies_through_the_operator_protocol() {
     let source = r#"import math
 print(math.prod([]), math.prod([2, 3], start=4), math.prod([1.5, 2]), math.prod(["a"], start=3))

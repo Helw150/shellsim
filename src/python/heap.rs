@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use super::bytecode::CodeRef;
 use super::mapping::OrderedMap;
-use super::native::{PyArgumentSpec, PyArrayDtype, PyArrayLayout};
+use super::native::{PyArgumentSpec, PyArrayBuffer, PyArrayView};
 use super::object_model::{BuiltinType, TypeId};
 use super::string::PyString;
 use super::Value;
@@ -29,7 +29,9 @@ const SYMBOL_NAME_BYTES: u64 = 24;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClassLayout {
     Object,
-    Int,
+    /// A subclass of a builtin value type such as `int` or `tuple`, whose instances carry a
+    /// value of that type in [`InstancePayload::Builtin`].
+    Builtin(BuiltinType),
     Type,
 }
 
@@ -37,7 +39,10 @@ pub enum ClassLayout {
 #[derive(Clone, Debug)]
 pub enum InstancePayload {
     Object,
-    Int(i64),
+    /// The builtin value an instance of a builtin subclass stands for, such as the `int` of
+    /// `class Flag(int)` or the `tuple` of a named tuple. Builtin operations that the class does
+    /// not override act on this value.
+    Builtin(Value),
 }
 
 /// Runtime-local identity for an interned Python identifier.
@@ -104,6 +109,20 @@ impl ObjectId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ScopeId(usize);
 
+/// Where a `globals()` view's bindings actually live.
+///
+/// An imported module's top-level code runs with its own lexical [`Scope`] (`uses_repl_globals`
+/// false), so `globals()` there is a live view of that scope. The entry-point script or an
+/// interactive REPL line runs with no scope of its own; its names, and those of any function or
+/// class body defined at that top level, live in the flat REPL/script table instead (see
+/// `ReplState::globals` and `Vm::scope_uses_repl_globals`). Keeping both cases in one type lets a
+/// single `globals()` implementation cover them without changing how either namespace is stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GlobalsTarget {
+    Scope(ScopeId),
+    Repl,
+}
+
 #[derive(Clone, Debug)]
 pub enum Object {
     /// A direct `object()` instance: identity only, with no attributes.
@@ -111,16 +130,19 @@ pub enum Object {
     String(PyString),
     Bytes(Vec<u8>),
     ByteArray(Vec<u8>),
+    /// An instance of a builtin exception class, with the constructor arguments `args`.
     Exception {
         kind: String,
-        message: String,
+        args: Vec<Value>,
     },
     List(Vec<Value>),
     Tuple(Vec<Value>),
+    /// `slice(start, stop, step)`. Bounds are any objects, as in CPython (`None` when
+    /// omitted); they become indices only when the slice subscripts a sequence.
     Slice {
-        start: Option<i64>,
-        stop: Option<i64>,
-        step: Option<i64>,
+        start: Value,
+        stop: Value,
+        step: Value,
     },
     Dict(OrderedMap),
     DefaultDict {
@@ -149,13 +171,15 @@ pub enum Object {
         defaults: Vec<Value>,
         /// Class captured when this function is installed by a class body.
         defining_class: Option<ObjectId>,
+        /// Names assigned on the function object, its `__dict__`.
+        attributes: HashMap<String, Value>,
     },
     Class {
         /// Semantic type identity used by instances of this class.
         instance_type: TypeId,
         name: String,
-        /// Direct user-defined bases in source order.
-        bases: Vec<ObjectId>,
+        /// Every direct base in source order, native bases included: `__bases__`.
+        bases: Vec<Value>,
         /// C3-linearized user-defined ancestors, excluding this class.
         mro: Vec<ObjectId>,
         /// The callable type object responsible for this class.
@@ -235,13 +259,25 @@ pub enum Object {
         name: String,
         scope: ScopeId,
     },
-    /// Flat type-erased storage shared by one or more array views.
-    ArrayStorage(Vec<Value>),
-    /// An ndarray view. Indices are mapped into `ArrayStorage` by the layout.
+    /// `globals()`: a live view over the namespace of the module whose code is running, backed by
+    /// [`GlobalsTarget`]. Reads, writes and deletes through it act on the same storage a bare name
+    /// lookup would.
+    Globals(GlobalsTarget),
+    /// Flat element storage shared by one or more array views: packed bytes, or traced Python
+    /// references for object arrays.
+    ArrayStorage(PyArrayBuffer),
+    /// An ndarray view. Byte strides and offset map indices into `ArrayStorage`.
     Array {
         storage: ObjectId,
-        layout: PyArrayLayout,
-        dtype: PyArrayDtype,
+        view: PyArrayView,
+        /// The array that owns the storage, for `ndarray.base`; `None` for owners.
+        base: Option<ObjectId>,
+    },
+    /// A registered value kind whose payload does not fit inline, such as a complex128 scalar.
+    WideValue {
+        type_id: TypeId,
+        kind: u8,
+        payload: [u64; 2],
     },
     /// A compiled regular expression.  The pattern is compiled at the operation boundary so
     /// regex execution never gets a host capability; keeping the source and flags here also
@@ -712,6 +748,45 @@ impl Heap {
         Ok(())
     }
 
+    /// Remove one instance attribute and return its value, or `None` when the instance does
+    /// not have it. A shaped instance first converts to dictionary storage, because shapes only
+    /// grow; attribute caches never match dictionary instances, so they stay valid.
+    pub fn remove_attribute_by_symbol(
+        &mut self,
+        id: ObjectId,
+        symbol: SymbolId,
+        resources: &mut Resources,
+    ) -> Result<Option<Value>, String> {
+        let shaped = match &self
+            .objects
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .ok_or("invalid object reference")?
+            .payload
+        {
+            Object::Instance {
+                attributes: InstanceAttributes::Shaped { shape, .. },
+                ..
+            } => Some(*shape),
+            Object::Instance { .. } => None,
+            _ => return Err("object does not have instance attributes".into()),
+        };
+        if let Some(shape) = shaped {
+            if self.shape_slot(shape, symbol).is_none() {
+                return Ok(None);
+            }
+            self.convert_to_dictionary(id, 0, resources)?;
+        }
+        let Object::Instance {
+            attributes: InstanceAttributes::Dictionary(values),
+            ..
+        } = self.get_mut(id)?
+        else {
+            unreachable!("instance was converted to dictionary storage")
+        };
+        Ok(values.remove(&symbol))
+    }
+
     fn insert_dictionary_attribute(
         &mut self,
         id: ObjectId,
@@ -719,6 +794,28 @@ impl Heap {
         value: Value,
         resources: &mut Resources,
     ) -> Result<(), String> {
+        if !self.convert_to_dictionary(id, INSTANCE_DICT_ENTRY_BYTES, resources)? {
+            return self.insert_attribute_by_symbol(id, symbol, value, resources);
+        }
+        let Object::Instance {
+            attributes: InstanceAttributes::Dictionary(values),
+            ..
+        } = self.get_mut(id)?
+        else {
+            unreachable!("instance was converted to dictionary storage")
+        };
+        values.insert(symbol, value);
+        Ok(())
+    }
+
+    /// Move a shaped instance's attributes into dictionary storage, reserving `extra` more
+    /// bytes. Returns `false` when the instance already uses a dictionary.
+    fn convert_to_dictionary(
+        &mut self,
+        id: ObjectId,
+        extra: u64,
+        resources: &mut Resources,
+    ) -> Result<bool, String> {
         let (shape, shaped_len) = match &self
             .objects
             .get(id.0)
@@ -733,17 +830,13 @@ impl Heap {
             Object::Instance {
                 attributes: InstanceAttributes::Dictionary(_),
                 ..
-            } => return self.insert_attribute_by_symbol(id, symbol, value, resources),
+            } => return Ok(false),
             _ => return Err("object does not have instance attributes".into()),
         };
         let existing = u64::try_from(shaped_len)
             .unwrap_or(u64::MAX)
             .saturating_mul(INSTANCE_DICT_ENTRY_BYTES.saturating_sub(INSTANCE_SLOT_BYTES));
-        self.reserve_object_growth(
-            id,
-            existing.saturating_add(INSTANCE_DICT_ENTRY_BYTES),
-            resources,
-        )?;
+        self.reserve_object_growth(id, existing.saturating_add(extra), resources)?;
         let shaped_values = match &self
             .objects
             .get(id.0)
@@ -764,7 +857,6 @@ impl Heap {
                 .ok_or("invalid instance shape slot")?;
             values.insert(attribute, value);
         }
-        values.insert(symbol, value);
         let Object::Instance { attributes, .. } = &mut self
             .objects
             .get_mut(id.0)
@@ -775,7 +867,7 @@ impl Heap {
             unreachable!("instance was validated before dictionary conversion")
         };
         *attributes = InstanceAttributes::Dictionary(values);
-        Ok(())
+        Ok(true)
     }
 
     fn shape_slot(&self, mut shape: ShapeId, attribute: SymbolId) -> Option<usize> {
@@ -1156,8 +1248,10 @@ impl Heap {
             | Object::StreamIterator { .. } => BuiltinType::Iterator.id(),
             Object::Generator { .. } => BuiltinType::Generator.id(),
             Object::Module { .. } => BuiltinType::Module.id(),
+            Object::Globals(_) => BuiltinType::Globals.id(),
             Object::ArrayStorage(_) => BuiltinType::Native.id(),
             Object::Array { .. } => BuiltinType::Array.id(),
+            Object::WideValue { type_id, .. } => *type_id,
             Object::Regex { .. } => BuiltinType::Regex.id(),
             Object::Match { .. } => BuiltinType::Match.id(),
             Object::ArgumentParser { .. } => BuiltinType::ArgumentParser.id(),
@@ -1381,7 +1475,9 @@ fn trace_object(
         | Object::Tuple(items)
         | Object::Set(items)
         | Object::FrozenSet(items)
-        | Object::ArrayStorage(items) => trace_values(items.iter().copied(), object_work),
+        | Object::ArrayStorage(PyArrayBuffer::Values(items)) => {
+            trace_values(items.iter().copied(), object_work)
+        }
         Object::Dict(entries) => {
             for (key, value) in entries {
                 trace_values([*key, *value], object_work);
@@ -1397,11 +1493,13 @@ fn trace_object(
             closure,
             defaults,
             defining_class,
+            attributes,
             ..
         } => {
             trace_values(defaults.iter().copied(), object_work);
             scope_work.extend(*closure);
             object_work.extend(*defining_class);
+            trace_values(attributes.values().copied(), object_work);
         }
         Object::Class {
             bases,
@@ -1412,7 +1510,7 @@ fn trace_object(
             enum_members,
             ..
         } => {
-            object_work.extend(bases.iter().copied());
+            trace_values(bases.iter().copied(), object_work);
             object_work.extend(mro.iter().copied());
             trace_value(*metaclass, object_work);
             trace_values(attributes.values().copied(), object_work);
@@ -1423,9 +1521,14 @@ fn trace_object(
             trace_values(enum_members.iter().copied(), object_work);
         }
         Object::Instance {
-            class, attributes, ..
+            class,
+            payload,
+            attributes,
         } => {
             object_work.push(*class);
+            if let InstancePayload::Builtin(value) = payload {
+                trace_value(*value, object_work);
+            }
             match attributes {
                 InstanceAttributes::Shaped { values, .. } => {
                     trace_values(values.iter().copied(), object_work);
@@ -1467,7 +1570,14 @@ fn trace_object(
             trace_value(*return_value, object_work);
         }
         Object::Module { scope, .. } => scope_work.push(*scope),
-        Object::Array { storage, .. } => object_work.push(*storage),
+        Object::Globals(GlobalsTarget::Scope(scope)) => scope_work.push(*scope),
+        // The REPL/script global table is already a GC root at every collection (see
+        // `Vm::collect_heap`), so this handle owns nothing further to trace.
+        Object::Globals(GlobalsTarget::Repl) => {}
+        Object::Array { storage, base, .. } => {
+            object_work.push(*storage);
+            object_work.extend(*base);
+        }
         Object::ArgumentParser {
             arguments,
             subparsers,
@@ -1503,12 +1613,14 @@ fn trace_object(
             object_work.push(*start_class);
             trace_value(*receiver, object_work);
         }
+        Object::Exception { args, .. } => trace_values(args.iter().copied(), object_work),
+        Object::Slice { start, stop, step } => trace_values([*start, *stop, *step], object_work),
         Object::Bare
         | Object::String(_)
         | Object::Bytes(_)
         | Object::ByteArray(_)
-        | Object::Exception { .. }
-        | Object::Slice { .. }
+        | Object::ArrayStorage(PyArrayBuffer::Bytes(_))
+        | Object::WideValue { .. }
         | Object::BigInt(_)
         | Object::Complex { .. }
         | Object::Range { .. }
@@ -1524,7 +1636,8 @@ fn trace_object(
 fn modeled_size(object: &Object) -> Result<u64, String> {
     const HEADER: u64 = 32;
     const VALUE: u64 = 24;
-    // Text and bytes are charged at their byte length rather than per value slot.
+    // Text, bytes, and packed array elements are charged at their byte length rather than per
+    // value slot.
     let packed = |length: usize| {
         u64::try_from(length)
             .ok()
@@ -1534,9 +1647,9 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
     let slots = match object {
         Object::String(value) => return packed(value.len()),
         Object::Bytes(value) | Object::ByteArray(value) => return packed(value.len()),
-        Object::Exception { kind, message } => kind
+        Object::Exception { kind, args } => kind
             .len()
-            .checked_add(message.len())
+            .checked_add(args.len())
             .ok_or("modeled object size overflow")?,
         Object::List(values)
         | Object::Tuple(values)
@@ -1547,7 +1660,7 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
         Object::BigInt(value) => usize::try_from(value.bits().saturating_add(7) / 8)
             .map_err(|_| "modeled big integer size overflow")?,
         // Sixteen bytes of payload rounded up to one modeled value slot.
-        Object::Complex { .. } => 1,
+        Object::Complex { .. } | Object::WideValue { .. } => 1,
         Object::Range { .. } => 3,
         Object::Dict(entries) => entries
             .len()
@@ -1562,11 +1675,13 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             name,
             code,
             defaults,
+            attributes,
             ..
         } => name
             .len()
             .checked_add(code.instructions.len())
             .and_then(|size| size.checked_add(defaults.len()))
+            .and_then(|size| size.checked_add(attributes.len()))
             .ok_or("modeled object size overflow")?,
         Object::Class {
             instance_type: _,
@@ -1618,11 +1733,15 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             .and_then(|size| size.checked_add(stack.len()))
             .ok_or("modeled object size overflow")?,
         Object::Module { name, .. } => name.len(),
-        Object::ArrayStorage(values) => values.len(),
-        Object::Array { layout, .. } => layout
+        // The namespace it views is charged where that namespace actually lives (the scope or
+        // the REPL/script global table), so the view itself is a fixed, minimal handle.
+        Object::Globals(_) => 1,
+        Object::ArrayStorage(PyArrayBuffer::Bytes(bytes)) => return packed(bytes.len()),
+        Object::ArrayStorage(PyArrayBuffer::Values(values)) => values.len(),
+        Object::Array { view, .. } => view
             .shape
             .len()
-            .checked_add(layout.strides.len())
+            .checked_add(view.strides.len())
             .and_then(|size| size.checked_add(3))
             .ok_or("modeled object size overflow")?,
         Object::Regex { pattern, .. } => pattern.len(),

@@ -11,11 +11,12 @@ use num_traits::{Signed, Zero};
 
 use super::super::native::PyValue as Value;
 use super::super::native::{
-    CallArgs, FunctionDef, MethodDef, NativeTypeDef, OwnedPyString, PyByteArray, PyBytes,
-    PyCallable, PyDict, PyError, PyIterator, PyKind, PyList, PyProperty, PyResult, PyRuntime,
-    PySequence, PySet, PyTuple, PyValue, PyValueCast,
+    CallArgs, FunctionDef, GetterDef, MethodDef, NativeTypeDef, OwnedPyString, PyByteArray,
+    PyBytes, PyCallable, PyDict, PyError, PyGlobals, PyIterator, PyKind, PyList, PyProperty,
+    PyResult, PyRuntime, PySequence, PySet, PyTuple, PyValue, PyValueCast,
 };
-use super::super::number::PyNumber;
+use super::super::number::{index_argument, PyNumber};
+use super::super::object_model::BuiltinType;
 use super::super::protocol;
 use super::super::slice::SlicePlan;
 use super::super::unicode;
@@ -93,6 +94,7 @@ pub(crate) static STRING_TYPE: NativeTypeDef = NativeTypeDef {
         method("str", "islower", string_islower),
         method("str", "isupper", string_isupper),
         method("str", "istitle", string_istitle),
+        method("str", "isidentifier", string_isidentifier),
     ],
     getters: &[],
 };
@@ -155,6 +157,12 @@ pub(crate) static BYTEARRAY_TYPE: NativeTypeDef = NativeTypeDef {
     getters: &[],
 };
 
+pub(crate) static SLICE_TYPE: NativeTypeDef = NativeTypeDef {
+    name: "slice",
+    methods: &[method("slice", "indices", slice_indices)],
+    getters: &[],
+};
+
 pub(crate) static LIST_TYPE: NativeTypeDef = NativeTypeDef {
     name: "list",
     methods: &[
@@ -173,9 +181,28 @@ pub(crate) static LIST_TYPE: NativeTypeDef = NativeTypeDef {
     getters: &[],
 };
 
+pub(crate) static TUPLE_TYPE: NativeTypeDef = NativeTypeDef {
+    name: "tuple",
+    methods: &[
+        method("tuple", "__new__", tuple_new),
+        method("tuple", "__repr__", tuple_repr),
+        method("tuple", "count", tuple_count),
+        method("tuple", "index", tuple_index),
+    ],
+    getters: &[],
+};
+
 pub(crate) static DICT_TYPE: NativeTypeDef = NativeTypeDef {
     name: "dict",
     methods: &[
+        method("dict", "__init__", dict_init),
+        method("dict", "__getitem__", dict_getitem),
+        method("dict", "__setitem__", dict_setitem),
+        method("dict", "__delitem__", dict_delitem),
+        method("dict", "__contains__", dict_contains),
+        method("dict", "__len__", dict_len),
+        method("dict", "__iter__", dict_iter),
+        method("dict", "__repr__", dict_repr),
         method("dict", "get", dict_get),
         method("dict", "keys", dict_keys),
         method("dict", "values", dict_values),
@@ -192,6 +219,26 @@ pub(crate) static DICT_TYPE: NativeTypeDef = NativeTypeDef {
 
 /// `dict` methods bound to the type, so `dict.fromkeys(...)` and `{}.fromkeys(...)` agree.
 pub(crate) static DICT_CLASS_METHODS: &[MethodDef] = &[method("dict", "fromkeys", dict_fromkeys)];
+
+/// `globals()`'s named methods. Subscript access, `del`, `len`, `in` and `iter` are builtin-slot
+/// behavior (see `object_model::install_builtin_slots`) rather than methods here, matching how
+/// `dict`'s own bytecode-level operations bypass its dunder methods below. `repr` is handled
+/// directly in `Vm::repr_nested`, alongside `dict`, `list` and `set`, so it shares their
+/// cycle-tracking rather than starting a fresh one per nested call.
+pub(crate) static GLOBALS_TYPE: NativeTypeDef = NativeTypeDef {
+    name: "shellsim.globals",
+    methods: &[
+        method("shellsim.globals", "get", globals_get_method),
+        method("shellsim.globals", "keys", globals_keys),
+        method("shellsim.globals", "values", globals_values),
+        method("shellsim.globals", "items", globals_items_method),
+        method("shellsim.globals", "setdefault", globals_setdefault),
+        method("shellsim.globals", "update", globals_update),
+        method("shellsim.globals", "pop", globals_pop),
+        method("shellsim.globals", "copy", globals_copy),
+    ],
+    getters: &[],
+};
 
 pub(crate) static SET_TYPE: NativeTypeDef = NativeTypeDef {
     name: "set",
@@ -249,10 +296,13 @@ pub(crate) static PROPERTY_TYPE: NativeTypeDef = NativeTypeDef {
 pub(crate) static OBJECT_TYPE: NativeTypeDef = NativeTypeDef {
     name: "object",
     methods: &[
+        method("object", "__new__", object_new),
         method("object", "__init__", object_init),
         method("object", "__hash__", object_hash),
         method("object", "__eq__", object_eq),
         method("object", "__ne__", object_ne),
+        method("object", "__setattr__", object_setattr),
+        method("object", "__delattr__", object_delattr),
     ],
     getters: &[],
 };
@@ -269,12 +319,55 @@ pub(crate) static ITERATOR_TYPE: NativeTypeDef = NativeTypeDef {
 pub(crate) static EXCEPTION_TYPE: NativeTypeDef = NativeTypeDef {
     name: "BaseException",
     methods: &[method("BaseException", "__init__", exception_init)],
-    getters: &[],
+    getters: &[
+        GetterDef {
+            owner: "BaseException",
+            name: "args",
+            get: exception_args,
+        },
+        GetterDef {
+            owner: "BaseException",
+            name: "value",
+            get: stop_iteration_value,
+        },
+    ],
 };
+
+/// `exception.args`: the constructor arguments of a builtin exception.
+fn exception_args(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    let (_, args) = runtime
+        .exception_args(&receiver)?
+        .ok_or_else(|| PyError::type_error("descriptor 'args' requires an exception"))?;
+    runtime.new_tuple(args)
+}
+
+/// `StopIteration.value`: the first argument, which is a generator's return value, or `None`.
+fn stop_iteration_value(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    match runtime.exception_args(&receiver)? {
+        Some((kind, args))
+            if super::super::exception_types::exception_is_subclass(&kind, "StopIteration") =>
+        {
+            Ok(args.first().copied().unwrap_or(Value::None))
+        }
+        Some(_) => Err(PyError::exception(
+            "AttributeError",
+            format!(
+                "'{}' object has no attribute 'value'",
+                runtime.type_name(&receiver)?
+            ),
+        )),
+        None => Err(PyError::type_error(
+            "descriptor 'value' requires an exception",
+        )),
+    }
+}
 
 pub(crate) static TYPE_TYPE: NativeTypeDef = NativeTypeDef {
     name: "type",
-    methods: &[method("type", "__new__", type_new)],
+    methods: &[
+        method("type", "__new__", type_new),
+        method("type", "mro", type_mro),
+    ],
     getters: &[],
 };
 
@@ -305,18 +398,20 @@ fn generator_next(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) 
     args.expect_positional("generator.__next__", 0, 0)?;
     args.reject_keywords("generator.__next__")?;
     let generator = receiver.cast::<PyIterator>(runtime)?;
-    runtime
-        .generator_send(generator, Value::None)?
-        .ok_or_else(|| PyError::exception("StopIteration", ""))
+    match runtime.generator_send(generator, Value::None)? {
+        Some(value) => Ok(value),
+        None => Err(runtime.generator_stop(generator)),
+    }
 }
 
 fn generator_send(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
     args.expect_positional("generator.send", 1, 1)?;
     args.reject_keywords("generator.send")?;
     let generator = receiver.cast::<PyIterator>(runtime)?;
-    runtime
-        .generator_send(generator, args.positional()[0])?
-        .ok_or_else(|| PyError::exception("StopIteration", ""))
+    match runtime.generator_send(generator, args.positional()[0])? {
+        Some(value) => Ok(value),
+        None => Err(runtime.generator_stop(generator)),
+    }
 }
 
 fn generator_close(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
@@ -504,6 +599,14 @@ fn string_istitle(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs
     let OwnedPyString(value) = receiver.cast(runtime)?;
     runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
     Ok(PyValue::Bool(unicode::is_title(&value)))
+}
+
+fn string_isidentifier(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("str.isidentifier", 0, 0)?;
+    args.reject_keywords("str.isidentifier")?;
+    let OwnedPyString(value) = receiver.cast(runtime)?;
+    runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
+    Ok(PyValue::Bool(unicode::is_identifier(&value)))
 }
 
 fn string_islower(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -852,7 +955,7 @@ fn bytes_center(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
         .ok_or_else(|| PyError::resource_error("centered bytes are too large"))?;
     runtime.reserve_memory(capacity)?;
     runtime.charge_cpu(u64::try_from(capacity).unwrap_or(u64::MAX))?;
-    let left = padding / 2;
+    let left = center_left_padding(padding, width);
     let mut result = Vec::with_capacity(capacity);
     result.extend(std::iter::repeat_n(fill, left));
     result.extend(value);
@@ -1928,6 +2031,13 @@ fn string_rjust(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
     string_justify(runtime, receiver, args, true)
 }
 
+/// The left share of `padding` for `str.center` and `bytes.center`: half, plus the odd unit when
+/// both the padding and the requested width are odd, as CPython does. So `'ab'.center(5)` is
+/// `'  ab '` but `'a'.center(4)` is `' a  '`.
+fn center_left_padding(padding: usize, width: i64) -> usize {
+    padding / 2 + (padding & usize::try_from(width).unwrap_or_default() & 1)
+}
+
 fn string_center(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("str.center", 1, 2)?;
     args.reject_keywords("str.center")?;
@@ -1950,7 +2060,7 @@ fn string_center(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs)
         .ok()
         .unwrap_or_default()
         .saturating_sub(value.chars().count());
-    let left = padding / 2;
+    let left = center_left_padding(padding, width);
     let right = padding - left;
     let fill_bytes = fill
         .len()
@@ -2105,9 +2215,10 @@ pub(crate) fn slot_string_remainder(
             used_mapping = true;
             let mapping = right.cast::<PyDict>(runtime)?;
             let key_value = runtime.new_string(key.clone())?;
-            runtime
-                .dict_get(mapping, &key_value)?
-                .ok_or_else(|| PyError::exception("KeyError", key))?
+            match runtime.dict_get(mapping, &key_value)? {
+                Some(value) => value,
+                None => return Err(runtime.exception_with_args("KeyError", vec![key_value])),
+            }
         } else {
             let value = arguments
                 .get(argument)
@@ -2354,12 +2465,13 @@ fn string_format(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs)
                         .get(index)
                         .ok_or_else(|| PyError::value_error("replacement index out of range"))?
                 } else {
-                    *args
-                        .keywords()
-                        .iter()
-                        .find(|(name, _)| name == field)
-                        .map(|(_, value)| value)
-                        .ok_or_else(|| PyError::exception("KeyError", field))?
+                    match args.keywords().iter().find(|(name, _)| name == field) {
+                        Some((_, value)) => *value,
+                        None => {
+                            let key = runtime.new_string(field.to_string())?;
+                            return Err(runtime.exception_with_args("KeyError", vec![key]));
+                        }
+                    }
                 };
                 result.push_str(&runtime.format_value(&value, conversion, specification)?);
             }
@@ -2494,20 +2606,29 @@ fn pop_index(raw: i64, length: usize) -> PyResult<usize> {
         .ok_or_else(|| PyError::exception("IndexError", "pop index out of range"))
 }
 
-/// Convert an index argument as CPython's `__index__` protocol does for builtin methods.
-fn index_argument(runtime: &dyn PyRuntime, value: &PyValue) -> PyResult<i64> {
-    if let Some(index) = runtime.int_value(value) {
-        return Ok(index);
+/// `slice.indices(length)`: the normalized `(start, stop, step)` for a sequence of `length`.
+fn slice_indices(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.reject_keywords("slice.indices")?;
+    let [length] = args.positional() else {
+        return Err(PyError::type_error(format!(
+            "slice.indices() takes exactly one argument ({} given)",
+            args.positional().len()
+        )));
+    };
+    let length = index_argument(runtime, length)?;
+    if length < 0 {
+        return Err(PyError::value_error("length should not be negative"));
     }
-    if runtime.kind(value)? == PyKind::Int {
-        return Err(PyError::overflow_error(
-            "Python int too large to convert to C ssize_t",
-        ));
-    }
-    let actual = runtime.type_name(value)?;
-    Err(PyError::type_error(format!(
-        "'{actual}' object cannot be interpreted as an integer"
-    )))
+    let (start, stop, step) = runtime
+        .slice_parts(&receiver)?
+        .ok_or_else(|| PyError::type_error("descriptor 'indices' requires a 'slice' object"))?;
+    let (start, stop, step) = super::super::slice::slice_indices(length, start, stop, step)
+        .map_err(PyError::value_error)?;
+    runtime.new_tuple(vec![
+        PyValue::Int(start),
+        PyValue::Int(stop),
+        PyValue::Int(step),
+    ])
 }
 
 fn list_remove(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -2548,24 +2669,73 @@ fn list_count(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) ->
     args.expect_positional("list.count", 1, 1)?;
     args.reject_keywords("list.count")?;
     let values = receiver.cast::<PyList>(runtime)?.items(runtime)?;
-    let mut count = 0i64;
-    for value in values {
-        runtime.charge_cpu(1)?;
-        if runtime.equals(&value, &args.positional()[0])? {
-            count = count
-                .checked_add(1)
-                .ok_or_else(|| PyError::overflow_error("list is too large"))?;
-        }
-    }
-    Ok(Value::Int(count))
+    count_equal(runtime, &values, &args.positional()[0], "list")
 }
 
 fn list_index(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("list.index", 1, 3)?;
     args.reject_keywords("list.index")?;
     let values = receiver.cast::<PyList>(runtime)?.items(runtime)?;
-    let length =
-        i64::try_from(values.len()).map_err(|_| PyError::overflow_error("list too large"))?;
+    index_of(runtime, &values, args.positional(), "list")
+}
+
+/// `tuple.__new__(cls, iterable=())`, which receives the class explicitly.
+fn tuple_new(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    runtime.new_builtin_instance(BuiltinType::Tuple, receiver, args)
+}
+
+/// `tuple.__repr__(self)`, which a subclass's own `__repr__` may call.
+fn tuple_repr(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("tuple.__repr__", 0, 0)?;
+    args.reject_keywords("tuple.__repr__")?;
+    let tuple = receiver.cast::<PyTuple>(runtime)?;
+    let text = runtime.repr(&Value::Object(tuple.object_id()))?;
+    runtime.new_string(text)
+}
+
+fn tuple_count(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("tuple.count", 1, 1)?;
+    args.reject_keywords("tuple.count")?;
+    let values = receiver.cast::<PyTuple>(runtime)?.items(runtime)?;
+    count_equal(runtime, &values, &args.positional()[0], "tuple")
+}
+
+fn tuple_index(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("tuple.index", 1, 3)?;
+    args.reject_keywords("tuple.index")?;
+    let values = receiver.cast::<PyTuple>(runtime)?.items(runtime)?;
+    index_of(runtime, &values, args.positional(), "tuple")
+}
+
+/// `sequence.count(value)` for a list or tuple of `values`.
+fn count_equal(
+    runtime: &mut dyn PyRuntime,
+    values: &[PyValue],
+    value: &PyValue,
+    kind: &str,
+) -> PyResult {
+    let mut count = 0i64;
+    for item in values {
+        runtime.charge_cpu(1)?;
+        if runtime.equals(item, value)? {
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| PyError::overflow_error(format!("{kind} is too large")))?;
+        }
+    }
+    Ok(Value::Int(count))
+}
+
+/// `sequence.index(value, start=0, stop=len)` for a list or tuple of `values`; `arguments` are
+/// the method's positional arguments.
+fn index_of(
+    runtime: &mut dyn PyRuntime,
+    values: &[PyValue],
+    arguments: &[PyValue],
+    kind: &str,
+) -> PyResult {
+    let length = i64::try_from(values.len())
+        .map_err(|_| PyError::overflow_error(format!("{kind} too large")))?;
     let endpoint = |value: Option<&PyValue>, default: i64| -> PyResult<i64> {
         value.map_or(Ok(default), |value| {
             runtime
@@ -2580,15 +2750,17 @@ fn list_index(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) ->
             value.min(length)
         }
     };
-    let start = normalize(endpoint(args.positional().get(1), 0)?);
-    let stop = normalize(endpoint(args.positional().get(2), length)?);
+    let start = normalize(endpoint(arguments.get(1), 0)?);
+    let stop = normalize(endpoint(arguments.get(2), length)?);
     for index in start..stop {
         runtime.charge_cpu(1)?;
-        if runtime.equals(&values[index as usize], &args.positional()[0])? {
+        if runtime.equals(&values[index as usize], &arguments[0])? {
             return Ok(Value::Int(index));
         }
     }
-    Err(PyError::value_error("list.index(x): x not in list"))
+    Err(PyError::value_error(format!(
+        "{kind}.index(x): x not in {kind}"
+    )))
 }
 
 fn list_sort(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -2636,6 +2808,84 @@ fn list_sort(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> 
     }
     runtime.replace_list_items(list, keyed.into_iter().map(|(_, value)| value).collect())?;
     Ok(Value::None)
+}
+
+/// `dict.__init__(self, other=(), **pairs)`: add the entries to `self`, which a subclass's own
+/// `__init__` reaches through `super().__init__(...)`.
+fn dict_init(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    if args.positional().len() > 1 {
+        return Err(PyError::type_error(format!(
+            "dict expected at most 1 argument, got {}",
+            args.positional().len()
+        )));
+    }
+    dict_update(runtime, receiver, args)
+}
+
+/// `dict.__getitem__(self, key)`, which a subclass's own `__getitem__` may call.
+fn dict_getitem(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("dict.__getitem__", 1, 1)?;
+    args.reject_keywords("dict.__getitem__")?;
+    let dict = receiver.cast::<PyDict>(runtime)?;
+    let key = args.positional()[0];
+    match runtime.dict_get(dict, &key)? {
+        Some(value) => Ok(value),
+        None => Err(runtime.exception_with_args("KeyError", vec![key])),
+    }
+}
+
+fn dict_setitem(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("dict.__setitem__", 2, 2)?;
+    args.reject_keywords("dict.__setitem__")?;
+    let dict = receiver.cast::<PyDict>(runtime)?;
+    runtime.dict_insert(dict, args.positional()[0], args.positional()[1])?;
+    Ok(Value::None)
+}
+
+fn dict_delitem(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("dict.__delitem__", 1, 1)?;
+    args.reject_keywords("dict.__delitem__")?;
+    let dict = receiver.cast::<PyDict>(runtime)?;
+    let key = args.positional()[0];
+    match runtime.dict_remove(dict, &key)? {
+        Some(_) => Ok(Value::None),
+        None => Err(runtime.exception_with_args("KeyError", vec![key])),
+    }
+}
+
+fn dict_contains(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("dict.__contains__", 1, 1)?;
+    args.reject_keywords("dict.__contains__")?;
+    let dict = receiver.cast::<PyDict>(runtime)?;
+    Ok(Value::Bool(
+        runtime.dict_get(dict, &args.positional()[0])?.is_some(),
+    ))
+}
+
+fn dict_len(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("dict.__len__", 0, 0)?;
+    args.reject_keywords("dict.__len__")?;
+    let entries = receiver.cast::<PyDict>(runtime)?.items(runtime)?;
+    let length =
+        i64::try_from(entries.len()).map_err(|_| PyError::overflow_error("dict is too large"))?;
+    Ok(Value::Int(length))
+}
+
+fn dict_iter(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("dict.__iter__", 0, 0)?;
+    args.reject_keywords("dict.__iter__")?;
+    let dict = receiver.cast::<PyDict>(runtime)?;
+    let iterator = runtime.iterator(Value::Object(dict.object_id()))?;
+    Ok(Value::Object(iterator.object_id()))
+}
+
+/// `dict.__repr__(self)`, which a subclass's own `__repr__` may call.
+fn dict_repr(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("dict.__repr__", 0, 0)?;
+    args.reject_keywords("dict.__repr__")?;
+    let dict = receiver.cast::<PyDict>(runtime)?;
+    let text = runtime.repr(&Value::Object(dict.object_id()))?;
+    runtime.new_string(text)
 }
 
 fn dict_get(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -2737,9 +2987,7 @@ fn dict_pop(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> P
     if let Some(default) = args.positional().get(1) {
         return Ok(*default);
     }
-    // CPython's KeyError carries the key, and `str()` shows its repr.
-    let key = runtime.repr(&args.positional()[0])?;
-    Err(PyError::exception("KeyError", key))
+    Err(runtime.exception_with_args("KeyError", vec![args.positional()[0]]))
 }
 
 /// Remove and return the most recently inserted `(key, value)` pair.
@@ -2749,11 +2997,8 @@ fn dict_popitem(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
     let dict = receiver.cast::<PyDict>(runtime)?;
     let mut entries = dict.items(runtime)?;
     let Some((key, value)) = entries.pop() else {
-        // The message is the `str()` of CPython's KeyError, which quotes its argument.
-        return Err(PyError::exception(
-            "KeyError",
-            "'popitem(): dictionary is empty'",
-        ));
+        let message = runtime.new_string("popitem(): dictionary is empty".into())?;
+        return Err(runtime.exception_with_args("KeyError", vec![message]));
     };
     // Committing the shorter snapshot rebuilds the key index in time linear in the size.
     runtime.charge_cpu(u64::try_from(entries.len()).unwrap_or(u64::MAX))?;
@@ -2789,8 +3034,206 @@ fn dict_fromkeys(runtime: &mut dyn PyRuntime, _class: PyValue, args: CallArgs) -
 fn dict_copy(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("dict.copy", 0, 0)?;
     args.reject_keywords("dict.copy")?;
-    let entries = receiver.cast::<PyDict>(runtime)?.items(runtime)?;
+    let dict = receiver.cast::<PyDict>(runtime)?;
+    runtime.dict_copy(dict)
+}
+
+fn globals_get_method(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    globals_lookup(runtime, receiver, args, false)
+}
+
+fn globals_setdefault(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    globals_lookup(runtime, receiver, args, true)
+}
+
+fn globals_lookup(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
+    insert: bool,
+) -> PyResult {
+    args.expect_positional("globals lookup", 1, 2)?;
+    args.reject_keywords("globals lookup")?;
+    let globals = receiver.cast::<PyGlobals>(runtime)?;
+    let OwnedPyString(name) = args.positional()[0].cast(runtime)?;
+    if let Some(value) = runtime.globals_get(globals, &name)? {
+        return Ok(value);
+    }
+    let default = args.positional().get(1).copied().unwrap_or(Value::None);
+    if insert {
+        runtime.globals_insert(globals, name, default)?;
+    }
+    Ok(default)
+}
+
+fn globals_keys(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    globals_projection(runtime, receiver, args, 0)
+}
+
+fn globals_values(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    globals_projection(runtime, receiver, args, 1)
+}
+
+fn globals_items_method(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
+) -> PyResult {
+    globals_projection(runtime, receiver, args, 2)
+}
+
+/// `globals()` views its contents as plain lists rather than dict-style live views: nothing in
+/// the required surface needs `keys()`/`values()`/`items()` to track later mutation, and a list
+/// keeps this consistent with how a snapshot already has to work for the REPL/script table.
+fn globals_projection(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
+    projection: u8,
+) -> PyResult {
+    args.expect_positional("globals view", 0, 0)?;
+    args.reject_keywords("globals view")?;
+    let globals = receiver.cast::<PyGlobals>(runtime)?;
+    let entries = runtime.globals_items(globals)?;
+    let mut values = Vec::with_capacity(entries.len());
+    for (key, value) in entries {
+        runtime.charge_cpu(1)?;
+        values.push(match projection {
+            0 => key,
+            1 => value,
+            _ => runtime.new_tuple(vec![key, value])?,
+        });
+    }
+    runtime.new_list(values)
+}
+
+fn globals_update(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("globals.update", 0, 1)?;
+    let globals = receiver.cast::<PyGlobals>(runtime)?;
+    let mut additions = Vec::new();
+    if let Some(source) = args.positional().first() {
+        if runtime.kind(source)? == PyKind::Dict {
+            additions.extend(source.cast::<PyDict>(runtime)?.items(runtime)?);
+        } else {
+            let iterator = runtime.iterator(*source)?;
+            while let Some(item) = runtime.iterator_next(iterator)? {
+                let pair = item.cast::<PySequence>(runtime)?.items(runtime)?;
+                if pair.len() != 2 {
+                    return Err(PyError::value_error(
+                        "dictionary update sequence element has length other than 2",
+                    ));
+                }
+                additions.push((pair[0], pair[1]));
+            }
+        }
+    }
+    for (name, value) in args.keywords() {
+        additions.push((runtime.new_string(name.clone())?, *value));
+    }
+    for (key, value) in additions {
+        let OwnedPyString(name) = key.cast(runtime)?;
+        runtime.globals_insert(globals, name, value)?;
+    }
+    Ok(Value::None)
+}
+
+fn globals_pop(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("globals.pop", 1, 2)?;
+    args.reject_keywords("globals.pop")?;
+    let globals = receiver.cast::<PyGlobals>(runtime)?;
+    let OwnedPyString(name) = args.positional()[0].cast(runtime)?;
+    if let Some(value) = runtime.globals_remove(globals, &name)? {
+        return Ok(value);
+    }
+    if let Some(default) = args.positional().get(1) {
+        return Ok(*default);
+    }
+    Err(runtime.exception_with_args("KeyError", vec![args.positional()[0]]))
+}
+
+/// `globals().copy()` returns a plain `dict` snapshot rather than another live `globals()`
+/// handle: CPython's own `globals().copy()` is already a plain dict, and a mutable copy backed by
+/// the same module scope would make "copy" a misnomer.
+fn globals_copy(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("globals.copy", 0, 0)?;
+    args.reject_keywords("globals.copy")?;
+    let globals = receiver.cast::<PyGlobals>(runtime)?;
+    let entries = runtime.globals_items(globals)?;
     runtime.new_dict(entries)
+}
+
+pub(crate) fn slot_globals_get_item(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    key: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let globals = receiver.cast::<PyGlobals>(runtime)?;
+    let OwnedPyString(name) = key.cast(runtime)?;
+    match runtime.globals_get(globals, &name)? {
+        Some(value) => Ok(Some(value)),
+        None => Err(runtime.exception_with_args("KeyError", vec![key])),
+    }
+}
+
+pub(crate) fn slot_globals_set_item(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    key: PyValue,
+    value: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let globals = receiver.cast::<PyGlobals>(runtime)?;
+    let OwnedPyString(name) = key.cast(runtime)?;
+    runtime.globals_insert(globals, name, value)?;
+    Ok(Some(Value::None))
+}
+
+pub(crate) fn slot_globals_delete_item(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    key: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let globals = receiver.cast::<PyGlobals>(runtime)?;
+    let OwnedPyString(name) = key.cast(runtime)?;
+    match runtime.globals_remove(globals, &name)? {
+        Some(_) => Ok(Some(Value::None)),
+        None => Err(runtime.exception_with_args("KeyError", vec![key])),
+    }
+}
+
+pub(crate) fn slot_globals_length(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let globals = receiver.cast::<PyGlobals>(runtime)?;
+    let length = runtime.globals_items(globals)?.len();
+    let length =
+        i64::try_from(length).map_err(|_| PyError::overflow_error("globals is too large"))?;
+    Ok(Some(Value::Int(length)))
+}
+
+pub(crate) fn slot_globals_contains(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    key: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let globals = receiver.cast::<PyGlobals>(runtime)?;
+    let OwnedPyString(name) = key.cast(runtime)?;
+    Ok(Some(Value::Bool(
+        runtime.globals_get(globals, &name)?.is_some(),
+    )))
+}
+
+pub(crate) fn slot_globals_iter(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let globals = receiver.cast::<PyGlobals>(runtime)?;
+    let keys = runtime
+        .globals_items(globals)?
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    Ok(Some(runtime.new_iterator(keys)?))
 }
 
 fn set_add(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -2832,8 +3275,7 @@ fn set_modify(
         }
         SetOperation::Remove => {
             if !runtime.set_remove(set, &value)? {
-                let element = runtime.repr(&value)?;
-                return Err(PyError::exception("KeyError", element));
+                return Err(runtime.exception_with_args("KeyError", vec![value]));
             }
         }
         SetOperation::Discard => {
@@ -2879,8 +3321,8 @@ fn set_pop(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> Py
     let set = mutable_set(runtime, receiver, "pop")?;
     let members = set.items(runtime)?;
     let Some(&value) = members.first() else {
-        // The message is the `str()` of CPython's KeyError, which quotes its argument.
-        return Err(PyError::exception("KeyError", "'pop from an empty set'"));
+        let message = runtime.new_string("pop from an empty set".into())?;
+        return Err(runtime.exception_with_args("KeyError", vec![message]));
     };
     // Removing the first member shifts the rest of the member vector.
     runtime.charge_cpu(u64::try_from(members.len()).unwrap_or(u64::MAX))?;
@@ -3431,9 +3873,11 @@ fn builtin_round(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         Some(_) | None => None,
     };
     let value = args.positional()[0];
-    if matches!(runtime.kind(&value)?, PyKind::Instance | PyKind::Complex) {
-        // Like CPython, defer to the type's `__round__`, so a user class such as `Fraction`
-        // rounds itself.
+    if runtime.value_kind_of(&value).is_some()
+        || matches!(runtime.kind(&value)?, PyKind::Instance | PyKind::Complex)
+    {
+        // Like CPython, defer to the type's `__round__`, so a NumPy scalar keeps its dtype and
+        // a user class such as `Fraction` rounds itself.
         let Some(method) = runtime.get_attribute(value, "__round__")? else {
             return Err(PyError::type_error(format!(
                 "type {} doesn't define __round__ method",
@@ -3561,6 +4005,12 @@ fn property_setter(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArg
 
 /// `object.__init__`, which ends an initializer chain reached through `super().__init__()`.
 /// It accepts only the instance.
+/// `object.__new__(cls)`: the receiver is the class, since `__new__` is a static method.
+fn object_new(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    let has_arguments = !args.positional().is_empty() || !args.keywords().is_empty();
+    runtime.new_instance(receiver, has_arguments)
+}
+
 fn object_init(_runtime: &mut dyn PyRuntime, _receiver: PyValue, args: CallArgs) -> PyResult {
     if !args.positional().is_empty() || !args.keywords().is_empty() {
         return Err(PyError::type_error(
@@ -3580,6 +4030,45 @@ fn object_hash(_runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
         None => immediate_identity(&receiver),
     };
     Ok(Value::Int(super::super::hash::identity(identity)))
+}
+
+/// `object.__delattr__(name)`: the default deletion, which a class's own `__delattr__` calls.
+fn object_delattr(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.reject_keywords("object.__delattr__")?;
+    let [name] = args.positional() else {
+        return Err(PyError::type_error(format!(
+            "expected 1 argument, got {}",
+            args.positional().len()
+        )));
+    };
+    let Some(name) = runtime.string_value(name)? else {
+        return Err(PyError::type_error(format!(
+            "attribute name must be string, not '{}'",
+            runtime.type_name(name)?
+        )));
+    };
+    runtime.delete_attribute_default(receiver, &name)?;
+    Ok(Value::None)
+}
+
+/// `object.__setattr__(name, value)`: the default assignment, which a class's own
+/// `__setattr__` calls to store a value after checking or transforming it.
+fn object_setattr(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.reject_keywords("object.__setattr__")?;
+    let [name, value] = args.positional() else {
+        return Err(PyError::type_error(format!(
+            "expected 2 arguments, got {}",
+            args.positional().len()
+        )));
+    };
+    let Some(name) = runtime.string_value(name)? else {
+        return Err(PyError::type_error(format!(
+            "attribute name must be string, not '{}'",
+            runtime.type_name(name)?
+        )));
+    };
+    runtime.set_attribute_default(receiver, &name, *value)?;
+    Ok(Value::None)
 }
 
 /// `iterator.__iter__`: a builtin iterator is its own iterator.
@@ -3646,6 +4135,17 @@ fn type_new(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> P
     args.reject_keywords("type.__new__")?;
     let OwnedPyString(name) = args.positional()[0].cast(runtime)?;
     runtime.new_type(receiver, name, args.positional()[1], args.positional()[2])
+}
+
+/// `cls.mro()`: the method resolution order as a list.
+fn type_mro(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("type.mro", 0, 0)?;
+    args.reject_keywords("type.mro")?;
+    let order = runtime
+        .get_attribute(receiver, "__mro__")?
+        .ok_or_else(|| PyError::type_error("descriptor 'mro' requires a type"))?;
+    let items = order.cast::<PyTuple>(runtime)?.items(runtime)?;
+    runtime.new_list(items)
 }
 
 pub(crate) fn slot_string_add(
@@ -3850,7 +4350,7 @@ pub(crate) fn slot_bytearray_set_item(
             .ok_or_else(|| PyError::value_error("byte must be in range(0, 256)"))?;
         let index = byte_index(index, items.len())?;
         items[index] = value;
-    } else if let Some((start, stop, step)) = runtime.slice_parts(&index) {
+    } else if let Some((start, stop, step)) = runtime.slice_parts(&index)? {
         let replacement = collect_bytes(runtime, value)?;
         let plan = SlicePlan::new(items.len(), start, stop, step).map_err(PyError::value_error)?;
         assign_slice(runtime, &mut items, plan, replacement)?;
@@ -3871,7 +4371,7 @@ pub(crate) fn slot_bytearray_delete_item(
     if let Some(index) = runtime.int_value(&index) {
         let index = byte_index(index, items.len())?;
         items.remove(index);
-    } else if let Some((start, stop, step)) = runtime.slice_parts(&index) {
+    } else if let Some((start, stop, step)) = runtime.slice_parts(&index)? {
         let plan = SlicePlan::new(items.len(), start, stop, step).map_err(PyError::value_error)?;
         delete_slice(runtime, &mut items, plan)?;
     } else {
@@ -3964,7 +4464,7 @@ pub(crate) fn slot_list_delete_item(
     if let Some(index) = runtime.int_value(&index) {
         let index = normalized_list_index(index, items.len())?;
         items.remove(index);
-    } else if let Some((start, stop, step)) = runtime.slice_parts(&index) {
+    } else if let Some((start, stop, step)) = runtime.slice_parts(&index)? {
         let plan = SlicePlan::new(items.len(), start, stop, step).map_err(PyError::value_error)?;
         delete_slice(runtime, &mut items, plan)?;
     } else {
@@ -3985,7 +4485,7 @@ pub(crate) fn slot_list_set_item(
     if let Some(index) = runtime.int_value(&index) {
         let index = normalized_list_index(index, items.len())?;
         items[index] = value;
-    } else if let Some((start, stop, step)) = runtime.slice_parts(&index) {
+    } else if let Some((start, stop, step)) = runtime.slice_parts(&index)? {
         let replacement = collect_values(runtime, value)?;
         let plan = SlicePlan::new(items.len(), start, stop, step).map_err(PyError::value_error)?;
         assign_slice(runtime, &mut items, plan, replacement)?;
@@ -4070,6 +4570,44 @@ fn delete_slice<T>(
     Ok(())
 }
 
+/// `left | right` for two dicts: a new dict holding `left`'s entries updated by `right`'s.
+/// Anything but a dict (or dict subclass) on either side declines, so `{} | [1]` raises
+/// `TypeError`.
+pub(crate) fn slot_dict_union(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    dict_union(runtime, left, right)
+}
+
+/// `left | right` reached through the right operand's dict type.
+pub(crate) fn slot_dict_reflected_union(
+    runtime: &mut dyn PyRuntime,
+    right: PyValue,
+    left: PyValue,
+) -> PyResult<Option<PyValue>> {
+    dict_union(runtime, left, right)
+}
+
+fn dict_union(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let (Ok(left), Ok(right)) = (left.cast::<PyDict>(runtime), right.cast::<PyDict>(runtime))
+    else {
+        return Ok(None);
+    };
+    let additions = right.items(runtime)?;
+    let union = runtime.dict_copy(left)?;
+    let dict = union.cast::<PyDict>(runtime)?;
+    for (key, value) in additions {
+        runtime.dict_insert(dict, key, value)?;
+    }
+    Ok(Some(union))
+}
+
 pub(crate) fn slot_dict_delete_item(
     runtime: &mut dyn PyRuntime,
     owner: PyValue,
@@ -4085,8 +4623,7 @@ pub(crate) fn slot_dict_delete_item(
         }
     }
     let Some(index) = found else {
-        let key = runtime.repr(&key)?;
-        return Err(PyError::exception("KeyError", key));
+        return Err(runtime.exception_with_args("KeyError", vec![key]));
     };
     items.remove(index);
     runtime.replace_dict_items(dict, items)?;

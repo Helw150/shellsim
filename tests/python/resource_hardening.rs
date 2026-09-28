@@ -431,8 +431,10 @@ fn complex_values_are_metered_heap_allocations() {
 
 #[test]
 fn complex_arrays_reserve_element_storage_before_allocation() {
+    // `import numpy` loads the Python half of the package, which needs about 2 MiB; the
+    // million-element array needs 16 MB.
     let limits = Limits {
-        memory: 64 * 1024,
+        memory: 4 * 1024 * 1024,
         ..Limits::unlimited()
     };
     let (status, stdout, _, _) = run_with_limits(
@@ -441,12 +443,191 @@ fn complex_arrays_reserve_element_storage_before_allocation() {
     );
     assert_eq!((status, stdout), (0, b"0j\n".to_vec()));
     let (status, stdout, stderr, usage) = run_with_limits(
-        "import numpy as np\nnp.zeros(100000, dtype=complex)",
+        "import numpy as np\nnp.zeros(1_000_000, dtype=complex)",
         limits,
     );
     assert_eq!(status, 137);
-    assert!(usage.memory_peak <= 64 * 1024);
+    assert!(usage.memory_peak <= 4 * 1024 * 1024);
     assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn numpy_linalg_charges_cubic_work_before_factoring() {
+    let limits = Limits {
+        cpu: 5_000_000,
+        ..Limits::unlimited()
+    };
+    let (status, stdout, stderr, _) = run_with_limits(
+        "import numpy as np\nprint(np.linalg.inv(np.eye(20)).trace())",
+        limits,
+    );
+    assert_eq!(
+        (status, stdout),
+        (0, b"20.0\n".to_vec()),
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    // Inverting 300x300 costs 2 * 300^3 units, which the call charges before factoring.
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import numpy as np\na = np.eye(300)\nprint('built')\nnp.linalg.inv(a)",
+        limits,
+    );
+    assert_eq!(status, 137);
+    assert_eq!(usage.cpu_used, 5_000_000);
+    assert_eq!(stdout, b"built\n");
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn numpy_jacobi_eigensolver_charges_each_sweep() {
+    let limits = Limits {
+        cpu: 5_000_000,
+        ..Limits::unlimited()
+    };
+    // Each sweep over a 120x120 matrix costs 120^3 units, so a few sweeps exhaust the budget
+    // even though the call charges only quadratic setup work up front.
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import numpy as np\na = np.arange(14400.0).reshape(120, 120) % 7\na = a + a.T\n\
+         print('built')\nnp.linalg.eigvalsh(a)",
+        limits,
+    );
+    assert_eq!(status, 137);
+    assert_eq!(usage.cpu_used, 5_000_000);
+    assert_eq!(stdout, b"built\n");
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn numpy_fft_charges_transform_work_before_running() {
+    let limits = Limits {
+        cpu: 5_000_000,
+        ..Limits::unlimited()
+    };
+    let (status, stdout, stderr, _) = run_with_limits(
+        "import numpy as np\nprint(np.fft.fft(np.ones(8)).real[0])",
+        limits,
+    );
+    assert_eq!(
+        (status, stdout),
+        (0, b"8.0\n".to_vec()),
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    // `numpy.fft` is frozen Python built from ordinary vectorized NumPy calls (moveaxis, take,
+    // reshape, exp, ...), each already metered per element by the native ufunc/array machinery
+    // they go through; a 64x4096 batch's log2(4096) = 12 butterfly stages charge for tens of
+    // millions of complex-array elements well before the transform finishes.
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import numpy as np\na = np.zeros((64, 4096))\nprint('built')\nnp.fft.fft(a)",
+        limits,
+    );
+    assert_eq!(status, 137);
+    assert_eq!(usage.cpu_used, 5_000_000);
+    assert_eq!(stdout, b"built\n");
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn numpy_sort_charges_n_log_n_work_before_sorting() {
+    let limits = Limits {
+        cpu: 5_000_000,
+        ..Limits::unlimited()
+    };
+    let (status, stdout, stderr, _) = run_with_limits(
+        "import numpy as np\nprint(np.sort(np.array([3, 1, 2])).tolist())",
+        limits,
+    );
+    assert_eq!(
+        (status, stdout),
+        (0, b"[1, 2, 3]\n".to_vec()),
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    // Sorting charges n * ceil(log2(n)) units per lane before any comparison runs, so two
+    // million elements exhausts the budget even though building the input is much cheaper.
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import numpy as np\na = np.arange(2_000_000)\nprint('built')\nnp.sort(a)",
+        limits,
+    );
+    assert_eq!(status, 137);
+    assert_eq!(usage.cpu_used, 5_000_000);
+    assert_eq!(stdout, b"built\n");
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn numpy_random_reserves_and_charges_before_drawing() {
+    let limits = Limits {
+        cpu: 5_000_000,
+        memory: 16 * 1024 * 1024,
+        ..Limits::unlimited()
+    };
+    let (status, stdout, stderr, _) = run_with_limits(
+        "import numpy as np\nprint(np.random.default_rng(1).random(1000).shape)",
+        limits,
+    );
+    assert_eq!(
+        (status, stdout),
+        (0, b"(1000,)\n".to_vec()),
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    // Ten million doubles need 80 MB, which the fill reserves before drawing.
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import numpy as np\nrng = np.random.default_rng(1)\nprint('seeded')\nrng.random(10_000_000)",
+        limits,
+    );
+    assert_eq!(status, 137);
+    assert!(usage.memory_peak <= 16 * 1024 * 1024);
+    assert_eq!(stdout, b"seeded\n");
+    assert!(stderr.is_empty());
+    // One million draws fit in memory but prepay a million CPU units at once.
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import numpy as np\nrng = np.random.default_rng(1)\nprint('seeded')\nrng.random(1_000_000)",
+        Limits {
+            cpu: 800_000,
+            ..limits
+        },
+    );
+    assert_eq!(status, 137);
+    assert_eq!(usage.cpu_used, 800_000);
+    assert_eq!(stdout, b"seeded\n");
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn numpy_loadtxt_stops_at_the_memory_limit() {
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import io\nimport numpy as np\ntext = '1 2 3\\n' * 5000\nprint(np.loadtxt(io.StringIO(text[:60])).shape)\nnp.loadtxt(io.StringIO(text * 100))",
+        Limits {
+            cpu: 50_000_000,
+            memory: 8 * 1024 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 137, "{}", String::from_utf8_lossy(&stderr));
+    assert!(usage.memory_peak <= 8 * 1024 * 1024);
+    assert_eq!(stdout, b"(10, 3)\n");
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn numpy_byte_copies_reserve_memory_before_copying() {
+    // Bytes are charged at their length, and each copy reserves its host buffer before it is
+    // made. Peak use is about 20 MB after `frombuffer` and 26 MB during `tobytes`.
+    let limits = Limits {
+        cpu: 50_000_000,
+        memory: 22 * 1024 * 1024,
+        ..Limits::unlimited()
+    };
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import numpy as np\ndata = bytes(6_000_000)\nvalues = np.frombuffer(data, np.uint8)\nprint('copied')\nvalues.tobytes()",
+        limits,
+    );
+    assert_eq!(status, 137, "{}", String::from_utf8_lossy(&stderr));
+    assert!(usage.memory_peak <= 22 * 1024 * 1024);
+    assert_eq!(stdout, b"copied\n");
     assert!(stderr.is_empty());
 }
 

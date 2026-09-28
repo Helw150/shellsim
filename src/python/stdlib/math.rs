@@ -10,9 +10,10 @@ use std::fmt;
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
 
+use super::super::ast::BinaryOperator;
 use super::super::native::PyValue as Value;
 use super::super::native::{
-    CallArgs, FunctionDef, ModuleDef, PyBinaryOp, PyConstant, PyError, PyKind, PyResult, PyRuntime,
+    CallArgs, FunctionDef, ModuleDef, PyConstant, PyError, PyKind, PyOperator, PyResult, PyRuntime,
     PyValueCast, ValueDef,
 };
 use super::super::number::PyNumber;
@@ -169,6 +170,11 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
             module: "math",
             name: "log2",
             call: native_log2,
+        },
+        FunctionDef {
+            module: "math",
+            name: "perm",
+            call: native_perm,
         },
         FunctionDef {
             module: "math",
@@ -398,6 +404,45 @@ fn native_comb(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     runtime.new_integer(&result.to_string())
 }
 
+/// Compute exact permutations `n! / (n - k)!` (`n!` when `k` is omitted or `None`), bounding work
+/// and result storage before multiplication as [`native_comb`] does.
+fn native_perm(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    args.expect_positional("math.perm", 1, 2)?;
+    args.reject_keywords("math.perm")?;
+    let n = integer_argument(runtime, &args.positional()[0], "perm")?;
+    let k = match args.positional().get(1) {
+        Some(value) if runtime.kind(value)? != PyKind::None => {
+            integer_argument(runtime, value, "perm")?
+        }
+        _ => n.clone(),
+    };
+    if n.is_negative() {
+        return Err(PyError::value_error("n must be a non-negative integer"));
+    }
+    if k.is_negative() {
+        return Err(PyError::value_error("k must be a non-negative integer"));
+    }
+    if k > n {
+        return runtime.new_integer("0");
+    }
+    let count = k
+        .to_usize()
+        .ok_or_else(|| PyError::resource_error("permutation length is too large"))?;
+    if count > 100_000 {
+        return Err(PyError::resource_error("permutation length is too large"));
+    }
+    let bytes = bigint_bytes(&n)?
+        .checked_mul(count.saturating_add(1))
+        .ok_or_else(|| PyError::resource_error("permutation result is too large"))?;
+    runtime.reserve_memory(bytes)?;
+    let mut result = BigInt::from(1_u8);
+    for index in 0..count {
+        runtime.charge_cpu(result.bits().div_ceil(64).saturating_add(1))?;
+        result *= &n - index;
+    }
+    runtime.new_integer(&result.to_string())
+}
+
 fn native_cos(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "cos")
 }
@@ -588,9 +633,10 @@ fn native_prod(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         None => Value::Int(1),
     };
     let iterator = runtime.iterator(args.positional()[0])?;
+    let multiply = PyOperator::Binary(BinaryOperator::Multiply);
     while let Some(item) = runtime.iterator_next(iterator)? {
         runtime.charge_cpu(1)?;
-        product = runtime.binary_op(PyBinaryOp::Multiply, product, item)?;
+        product = runtime.apply_operator(multiply, &[product, item])?;
     }
     Ok(product)
 }
